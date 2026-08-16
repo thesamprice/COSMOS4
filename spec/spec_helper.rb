@@ -151,7 +151,8 @@ def running_threads
       thread_name = JRuby.reference(t).native_thread.get_name
       threads << t.inspect unless thread_name == "Finalizer" or thread_name.include?("JRubyWorker")
     else
-      threads << t.inspect
+      # Modern Ruby's timeout stdlib keeps one persistent daemon thread
+      threads << t.inspect unless t.name == "Timeout stdlib thread"
     end
   end
   return threads
@@ -170,7 +171,7 @@ def kill_leftover_threads
   else
     if Thread.list.length > 1
       Thread.list.each do |t|
-        t.kill if t != Thread.current
+        t.kill if t != Thread.current and t.name != "Timeout stdlib thread"
       end
       sleep(0.2)
     end

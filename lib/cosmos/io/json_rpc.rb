@@ -46,7 +46,9 @@ class String
 
   def as_json(options = nil)
     if self =~ NON_ASCII_PRINTABLE
-      self.to_json_raw_object
+      # Equivalent to the old json gem's to_json_raw_object which was
+      # removed from the json gem
+      { JSON.create_id => self.class.name, 'raw' => self.unpack('C*') }
     else
       self
     end

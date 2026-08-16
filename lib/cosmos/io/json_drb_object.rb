@@ -151,7 +151,15 @@ module Cosmos
     def handle_response(response_data)
       # The code below will always either raise or return breaking out of the loop
       if response_data and response_data.to_s.length > 0
-        response = JsonRpcResponse.from_json(response_data)
+        begin
+          response = JsonRpcResponse.from_json(response_data)
+        rescue
+          # An unparseable response means the server side failed before
+          # producing a JSON-RPC response (e.g. puma's lowlevel_error page).
+          # Treat it like the connection dropped.
+          disconnect()
+          raise DRb::DRbConnError, "Invalid response from server: #{response_data.to_s[0, 100]}"
+        end
         if JsonRpcErrorResponse === response
           if response.error.data
             raise Exception.from_hash(response.error.data)

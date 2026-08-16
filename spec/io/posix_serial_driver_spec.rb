@@ -14,7 +14,7 @@
 #     No such file or directory @ rb_sysopen - /dev/ttyS0
 #   ./lib/cosmos/io/posix_serial_driver.rb:48:in `initialize'
 
-if RbConfig::CONFIG['target_os'] !~ /mswin|mingw|cygwin/i and RUBY_ENGINE == 'ruby' and !ENV['CI'] and !ENV['DOCKER']
+if RbConfig::CONFIG['target_os'] !~ /mswin|mingw|cygwin/i and RUBY_ENGINE == 'ruby' and !ENV['CI'] and !ENV['DOCKER'] and File.exist?('/dev/ttyS0')
 
   require 'spec_helper'
   require 'cosmos/io/posix_serial_driver'
