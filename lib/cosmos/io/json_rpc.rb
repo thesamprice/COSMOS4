@@ -108,22 +108,20 @@ class Hash
   end
 end
 
+# Don't build these on top of to_json: json/add/core (required above)
+# redefines Time/Date/DateTime#to_json in terms of as_json which would
+# recurse. to_s produces the same representation the old
+# to_json.remove_quotes did.
 class Time
-  def as_json(options = nil) #:nodoc:
-    to_json(options).remove_quotes
-  end
+  def as_json(options = nil) to_s end #:nodoc:
 end
 
 class Date
-  def as_json(options = nil) #:nodoc:
-    to_json(options).remove_quotes
-  end
+  def as_json(options = nil) to_s end #:nodoc:
 end
 
 class DateTime
-  def as_json(options = nil) #:nodoc:
-    to_json(options).remove_quotes
-  end
+  def as_json(options = nil) to_s end #:nodoc:
 end
 
 class Exception
