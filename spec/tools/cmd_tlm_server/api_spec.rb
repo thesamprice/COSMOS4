@@ -31,7 +31,9 @@ module Cosmos
         file.puts 'BACKGROUND_TASK example_background_task1.rb'
         file.puts 'BACKGROUND_TASK example_background_task2.rb'
       end
+      # Save the checked-in example background tasks before overwriting them
       @background1 = File.join(Cosmos::USERPATH,'lib','example_background_task1.rb')
+      FileUtils.cp @background1, Cosmos::USERPATH if File.exist?(@background1)
       File.open(@background1,'w') do |file|
         file.write <<-DOC
 require 'cosmos/tools/cmd_tlm_server/background_task'
@@ -54,6 +56,7 @@ end
 DOC
       end
       @background2 = File.join(Cosmos::USERPATH,'lib','example_background_task2.rb')
+      FileUtils.cp @background2, Cosmos::USERPATH if File.exist?(@background2)
       File.open(@background2,'w') do |file|
         file.write <<-DOC
 require 'cosmos/tools/cmd_tlm_server/background_task'
@@ -80,8 +83,15 @@ DOC
     end
 
     after(:all) do
-      FileUtils.rm_rf @background1
-      FileUtils.rm_rf @background2
+      # Restore the checked-in example background tasks
+      [@background1, @background2].each do |bg|
+        saved = File.join(Cosmos::USERPATH, File.basename(bg))
+        if File.exist?(saved)
+          FileUtils.mv saved, bg
+        else
+          FileUtils.rm_rf bg
+        end
+      end
       # Restore cmd_tlm_server.txt
       FileUtils.mv File.join(Cosmos::USERPATH, 'cmd_tlm_server.txt'),
       File.join(Cosmos::USERPATH,'config','tools','cmd_tlm_server')

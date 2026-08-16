@@ -15,7 +15,26 @@ require 'tempfile'
 
 module Cosmos
   describe Script do
+    # JsonDRbObject proxies calls via method_missing. Object gains *private*
+    # display/clear/etc. methods from the top-level include of Cosmos::Script,
+    # so any_instance stubs inherit private visibility and explicit-receiver
+    # calls would bypass them and hit the network. Stub then re-publicize.
+    def stub_tlm_viewer(method, error = nil)
+      if error
+        allow_any_instance_of(JsonDRbObject).to receive(method).and_raise(error)
+      else
+        allow_any_instance_of(JsonDRbObject).to receive(method)
+      end
+      JsonDRbObject.send(:public, method)
+    end
+
     before(:each) do
+      # scripting_spec.rb defines ScriptRunnerFrame stubs whose class
+      # definitions leak across spec files. Make sure any leaked stub
+      # reports no active instance here.
+      if defined?(ScriptRunnerFrame)
+        ScriptRunnerFrame.singleton_class.send(:define_method, :instance) { nil }
+      end
       allow_any_instance_of(Interface).to receive(:connected?).and_return(true)
       allow_any_instance_of(Interface).to receive(:disconnect)
       allow_any_instance_of(Interface).to receive(:write)
@@ -35,7 +54,7 @@ module Cosmos
 
     describe "display" do
       it "displays a telemetry viewer screen" do
-        allow_any_instance_of(JsonDRbObject).to receive(:display)
+        stub_tlm_viewer(:display)
         display("HI")
       end
 
@@ -48,14 +67,14 @@ module Cosmos
       end
 
       it "complains if the screen doesn't exist" do
-        allow_any_instance_of(JsonDRbObject).to receive(:display).and_raise(Errno::ENOENT)
+        stub_tlm_viewer(:display, Errno::ENOENT)
         expect { display("HI") }.to raise_error(RuntimeError, /HI.txt does not exist/)
       end
     end
 
     describe "clear" do
       it "closes a telemetry viewer screen" do
-        allow_any_instance_of(JsonDRbObject).to receive(:clear)
+        stub_tlm_viewer(:clear)
         clear("HI")
       end
 
@@ -68,14 +87,14 @@ module Cosmos
       end
 
       it "complains if the screen doesn't exist" do
-        allow_any_instance_of(JsonDRbObject).to receive(:clear).and_raise(Errno::ENOENT)
+        stub_tlm_viewer(:clear, Errno::ENOENT)
         expect { clear("HI") }.to raise_error(RuntimeError, /HI.txt does not exist/)
       end
     end
 
     describe "clear_all" do
       it "closes all telemetry viewer screens" do
-        allow_any_instance_of(JsonDRbObject).to receive(:clear_all)
+        stub_tlm_viewer(:clear_all)
         clear_all
       end
 
@@ -90,6 +109,8 @@ module Cosmos
 
     describe "ScriptRunnerFrame methods" do
       it "calls various ScriptRunnerFrame methods" do
+        # step_mode etc. call Qt.execute_in_main_thread
+        skip "requires Qt bindings" unless defined?(Qt)
         class Dummy; def method_missing(meth, *args, &block); end; end
         class ScriptRunnerFrame
           def self.method_missing(meth, *args, &block); end

@@ -9,6 +9,10 @@
 # attribution addendums as found in the LICENSE.txt
 
 require 'json'
+# Defines String.json_create et al so that raw (non-UTF8) strings encoded as
+# {"json_class":"String","raw":[...]} round-trip through JSON.parse with
+# :create_additions
+require 'json/add/core'
 require 'date'
 
 class Object
