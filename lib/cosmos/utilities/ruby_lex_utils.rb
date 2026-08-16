@@ -8,181 +8,62 @@
 # as published by the Free Software Foundation; version 3 with
 # attribution addendums as found in the LICENSE.txt
 
-require 'irb/ruby-lex'
-require 'stringio'
+require 'ripper'
 
-# Clear the $VERBOSE global since we're overriding methods
-old_verbose = $VERBOSE; $VERBOSE = nil
-class RubyLex
-  if self.method_defined?(:indent)
-    attr_writer :indent
-  else
-    attr_accessor :indent
-  end
-  # @return [Integer] The expression line number. This can differ from the
-  #   actual line number due to white space and Ruby control keywords.
-  attr_accessor :exp_line_no
-
-  # Resets the RubyLex in preparation of parsing a line
-  def reinitialize
-    @seek                      = 0
-    @exp_line_no               = 1
-    @line_no                   = 1
-    @base_char_no              = 0
-    @char_no                   = 0
-    @rests.clear
-    @readed.clear
-    @here_readed.clear
-    @indent                    = 0
-    @indent_stack.clear
-    @lex_state                 = EXPR_BEG
-    @space_seen                = false
-    @here_header               = false
-    @continue                  = false
-    @line                      = ''
-    @skip_space                = false
-    @readed_auto_clean_up      = false
-    @exception_on_syntax_error = true
-    @prompt                    = nil
-  end
-  
-  # Monkey patch to keep this from looping forever if the string never is closed with a right brace
-  def identify_string_dvar
-    begin
-      getc
-
-      reserve_continue = @continue
-      reserve_ltype = @ltype
-      reserve_indent = @indent
-      reserve_indent_stack = @indent_stack
-      reserve_state = @lex_state
-      reserve_quoted = @quoted
-
-      @ltype = nil
-      @quoted = nil
-      @indent = 0
-      @indent_stack = []
-      @lex_state = EXPR_BEG
-
-      loop do
-        @continue = false
-        prompt
-        tk = token
-        break if tk.nil? # This is the patch
-        if @ltype or @continue or @indent >= 0
-          next
-        end
-        break if tk.kind_of?(TkRBRACE)
-      end
-    ensure
-      @continue = reserve_continue
-      @ltype = reserve_ltype
-      @indent = reserve_indent
-      @indent_stack = reserve_indent_stack
-      @lex_state = reserve_state
-      @quoted = reserve_quoted
-    end
-  end  
-  
-end
-$VERBOSE = old_verbose
-
+# Analyzes Ruby code lexically using Ripper. Formerly built on irb's
+# RubyLex/RubyToken API which was removed from modern Ruby.
 class RubyLexUtils
   # Regular expression to detect blank lines
   BLANK_LINE_REGEX  = /^\s*$/
   # Regular expression to detect lines containing only 'else'
   LONELY_ELSE_REGEX = /^\s*else\s*$/
 
-  # Ruby keywords
-  KEYWORD_TOKENS = [RubyToken::TkCLASS,
-                    RubyToken::TkMODULE,
-                    RubyToken::TkDEF,
-                    RubyToken::TkUNDEF,
-                    RubyToken::TkBEGIN,
-                    RubyToken::TkRESCUE,
-                    RubyToken::TkENSURE,
-                    RubyToken::TkEND,
-                    RubyToken::TkIF,
-                    RubyToken::TkUNLESS,
-                    RubyToken::TkTHEN,
-                    RubyToken::TkELSIF,
-                    RubyToken::TkELSE,
-                    RubyToken::TkCASE,
-                    RubyToken::TkWHEN,
-                    RubyToken::TkWHILE,
-                    RubyToken::TkUNTIL,
-                    RubyToken::TkFOR,
-                    RubyToken::TkBREAK,
-                    RubyToken::TkNEXT,
-                    RubyToken::TkREDO,
-                    RubyToken::TkRETRY,
-                    RubyToken::TkIN,
-                    RubyToken::TkDO,
-                    RubyToken::TkRETURN,
-                    RubyToken::TkIF_MOD,
-                    RubyToken::TkUNLESS_MOD,
-                    RubyToken::TkWHILE_MOD,
-                    RubyToken::TkUNTIL_MOD,
-                    RubyToken::TkALIAS,
-                    RubyToken::TklBEGIN,
-                    RubyToken::TklEND,
-                    RubyToken::TkfLBRACE]
+  # Ruby keywords (both statement and modifier forms lex to the same value)
+  KEYWORDS = %w(class module def undef begin rescue ensure end if unless
+                then elsif else case when while until for break next redo
+                retry in do return alias BEGIN END).freeze
 
-  # Ruby keywords which define the beginning of a block: do, {, begin
-  BLOCK_BEGINNING_TOKENS = [RubyToken::TkDO,
-                            RubyToken::TkfLBRACE,
-                            RubyToken::TkBEGIN]
+  # Keywords which begin a block: do, begin ('{' is handled via tokens)
+  BLOCK_BEGINNING_KEYWORDS = %w(do begin).freeze
 
-  # Create a new RubyLex and StringIO to hold the text to operate on
-  def initialize
-    @lex    = RubyLex.new
-    @lex_io = StringIO.new('')
-  end
+  # Keywords which open an indent level and are closed by 'end'.
+  # if/unless/while/until only count in statement (non-modifier) form.
+  INDENT_KEYWORDS = %w(class module def begin case for do if unless while until).freeze
+
+  # Token types which open a string-like literal closed by an end token
+  STRING_OPEN_TOKENS = %i(on_tstring_beg on_heredoc_beg on_regexp_beg
+                          on_words_beg on_qwords_beg on_symbols_beg
+                          on_qsymbols_beg on_backtick).freeze
+  # Token types which close a string-like literal
+  STRING_CLOSE_TOKENS = %i(on_tstring_end on_heredoc_end on_regexp_end).freeze
+
+  # Token types which carry no meaning for continuation decisions
+  IGNORED_TOKENS = %i(on_sp on_nl on_ignored_nl on_comment
+                      on_embdoc_beg on_embdoc on_embdoc_end).freeze
 
   # @param text [String]
   # @return [Boolean] Whether the text contains the 'begin' keyword
   def contains_begin?(text)
-    @lex.reinitialize
-    @lex.exception_on_syntax_error = false
-    @lex_io.string = text
-    @lex.set_input(@lex_io)
-    while token = @lex.token
-      if token.class == RubyToken::TkBEGIN
-        return true
-      end
-    end
-    return false
+    Ripper.lex(text).to_a.any? { |_pos, type, token, _state| type == :on_kw and token == 'begin' }
   end
 
   # @param text [String]
-  # @return [Boolean] Whether the text contains a Ruby keyword
+  # @return [Boolean] Whether the text contains a Ruby keyword or a block '{'
   def contains_keyword?(text)
-    @lex.reinitialize
-    @lex.exception_on_syntax_error = false
-    @lex_io.string = text
-    @lex.set_input(@lex_io)
-    while token = @lex.token
-      if KEYWORD_TOKENS.include?(token.class)
-        return true
-      end
+    Ripper.lex(text).to_a.any? do |_pos, type, token, state|
+      (type == :on_kw and KEYWORDS.include?(token)) or
+        (type == :on_lbrace and block_brace?(state))
     end
-    return false
   end
 
   # @param text [String]
   # @return [Boolean] Whether the text contains a keyword which starts a block.
   #   i.e. 'do', '{', or 'begin'
   def contains_block_beginning?(text)
-    @lex.reinitialize
-    @lex.exception_on_syntax_error = false
-    @lex_io.string = text
-    @lex.set_input(@lex_io)
-    while token = @lex.token
-      if BLOCK_BEGINNING_TOKENS.include?(token.class)
-        return true
-      end
+    Ripper.lex(text).to_a.any? do |_pos, type, token, state|
+      (type == :on_kw and BLOCK_BEGINNING_KEYWORDS.include?(token)) or
+        (type == :on_lbrace and block_brace?(state))
     end
-    return false
   end
 
   # @param text [String]
@@ -191,33 +72,26 @@ class RubyLexUtils
   # @return [String] The text with all comments removed
   def remove_comments(text, progress_dialog = nil)
     comments_removed = text.clone
-    @lex.reinitialize
-    @lex.exception_on_syntax_error = false
-    @lex_io.string = text
-    @lex.set_input(@lex_io)
-    need_remove = nil
+    # Byte offset of the start of each line
+    line_offsets = [0]
+    text.each_line { |line| line_offsets << line_offsets[-1] + line.length }
+
     delete_ranges = []
     token_count = 0
     progress = 0.0
-    while token = @lex.token
+    Ripper.lex(text).to_a.each do |(line, col), type, token, _state|
       token_count += 1
-      if need_remove
-        delete_ranges << (need_remove..(token.seek - 1))
-        need_remove = nil
-      end
-      if token.class == RubyToken::TkCOMMENT
-        need_remove = token.seek
+      if type == :on_comment
+        offset = line_offsets[line - 1] + col
+        # Preserve the newline which terminates the comment
+        comment = token.chomp
+        delete_ranges << (offset..(offset + comment.length - 1)) unless comment.empty?
       end
       if progress_dialog and token_count % 10000 == 0
         progress += 0.01
         progress = 0.0 if progress >= 0.99
         progress_dialog.set_overall_progress(progress)
       end
-    end
-
-    if need_remove
-      delete_ranges << (need_remove..(text.length - 1))
-      need_remove = nil
     end
 
     delete_count = 0
@@ -242,19 +116,19 @@ class RubyLexUtils
   # @yieldparam inside_begin [Integer] The level of indentation
   # @yieldparam line_no [Integer] The current line number
   def each_lexed_segment(text)
-    lex = RubyLex.new
-    lex.exception_on_syntax_error = false
-    lex_io = StringIO.new(text)
-    lex.set_input(lex_io)
+    inside_begin = nil
+    indent = 0
+    line_no = 1
 
-    while lexed = lex.lex
-      line_no = lex.exp_line_no
+    each_segment(text) do |lexed|
+      next_line_no = line_no + lexed.count("\n")
+      indent += indent_delta(lexed)
 
       if contains_begin?(lexed)
-        inside_begin = lex.indent - 1
+        inside_begin = indent - 1
       end
 
-      if lex.indent == inside_begin
+      if indent == inside_begin
         inside_begin = nil
       end
 
@@ -304,9 +178,88 @@ class RubyLexUtils
             yield lexed, true, inside_begin, line_no
           end
         end
-        lex.exp_line_no = lex.line_no
         break
       end # loop do
-    end # while lexed
+      line_no = next_line_no
+    end # each_segment
   end # def each_lexed_segment
+
+  private
+
+  # A '{' token which starts a block rather than a hash literal.
+  # Ripper marks hash-literal braces with the LABEL state bit.
+  def block_brace?(state)
+    !state.allbits?(Ripper::EXPR_LABEL)
+  end
+
+  # Yields consecutive lexically-complete segments of text. A segment ends at
+  # a newline unless the text so far has unbalanced brackets, an unterminated
+  # string/heredoc, or ends with a continuation token (operator, comma, '.',
+  # 'and'/'or'/'not', or a trailing backslash).
+  def each_segment(text)
+    buffer = +''
+    text.each_line do |line|
+      buffer << line
+      if segment_complete?(buffer)
+        yield buffer
+        buffer = +''
+      end
+    end
+    yield buffer unless buffer.empty?
+  end
+
+  def segment_complete?(buffer)
+    return false if buffer.end_with?("\\\n")
+    tokens = Ripper.lex(buffer).to_a
+    parens = brackets = braces = strings = embdocs = 0
+    last_type = nil
+    last_token = nil
+    tokens.each do |_pos, type, token, _state|
+      case type
+      when :on_lparen               then parens += 1
+      when :on_rparen               then parens -= 1
+      when :on_lbracket             then brackets += 1
+      when :on_rbracket             then brackets -= 1
+      when :on_lbrace, :on_tlambeg,
+           :on_embexpr_beg          then braces += 1
+      when :on_rbrace, :on_embexpr_end then braces -= 1
+      when *STRING_OPEN_TOKENS      then strings += 1
+      when *STRING_CLOSE_TOKENS     then strings -= 1
+      when :on_embdoc_beg           then embdocs += 1
+      when :on_embdoc_end           then embdocs -= 1
+      end
+      unless IGNORED_TOKENS.include?(type) or type == :on_tstring_content or
+             type == :on_words_sep or type == :on_heredoc_end
+        last_type = type
+        last_token = token
+      end
+    end
+    return false if parens > 0 or brackets > 0 or braces > 0 or strings > 0 or embdocs > 0
+    case last_type
+    when :on_comma, :on_period
+      return false
+    when :on_op
+      # '|' most commonly ends block params: 'do |x|'
+      return false unless last_token == '|'
+    when :on_kw
+      return false if %w(and or not).include?(last_token)
+    end
+    return true
+  end
+
+  # Net indent level change of a segment: keywords which open an
+  # indent level minus 'end' keywords. Modifier if/unless/while/until
+  # (marked with the LABEL state bit) do not open an indent level.
+  def indent_delta(text)
+    delta = 0
+    Ripper.lex(text).to_a.each do |_pos, type, token, state|
+      next unless type == :on_kw
+      if INDENT_KEYWORDS.include?(token)
+        delta += 1 unless state.allbits?(Ripper::EXPR_LABEL)
+      elsif token == 'end'
+        delta -= 1
+      end
+    end
+    delta
+  end
 end

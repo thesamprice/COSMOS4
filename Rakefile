@@ -138,7 +138,6 @@ task :build => [:devkit] do
 
     extensions = [
       'crc',
-      'low_fragmentation_array',
       'polynomial_conversion',
       'config_parser',
       'string',

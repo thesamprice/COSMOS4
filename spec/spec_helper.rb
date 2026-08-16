@@ -22,11 +22,13 @@ end
 # NOTE: You MUST require simplecov before anything else!
 if !ENV['COSMOS_NO_SIMPLECOV']
   require 'simplecov'
-  require 'codecov'
-  SimpleCov.formatter = SimpleCov::Formatter::MultiFormatter.new([
-    SimpleCov::Formatter::HTMLFormatter,
-    SimpleCov::Formatter::Codecov,
-  ])
+  formatters = [SimpleCov::Formatter::HTMLFormatter]
+  if ENV['CI']
+    # Only upload to codecov from CI
+    require 'codecov'
+    formatters << SimpleCov::Formatter::Codecov
+  end
+  SimpleCov.formatter = SimpleCov::Formatter::MultiFormatter.new(formatters)
   SimpleCov.start do
     merge_timeout 12 * 60 * 60 # merge the last 12 hours of results
     add_filter '/spec/'
