@@ -29,15 +29,29 @@ lm.update_log("WARN: INST HEALTH_STATUS TEMP2 = 3.0 is YELLOW_HIGH\n", :YELLOW)
 lm.update_log("INFO: Packet INST MECH is STALE\n", :BLACK)
 pump(10)
 log_text = lm.instance_variable_get(:@log_output).toPlainText
-check("log has 3 entries", log_text.split("\n").length == 3)
-check('log content', log_text.include?('TEMP1 = 9.0 is RED_HIGH') &&
-                     log_text.include?('INST MECH is STALE'))
+# The limits thread may add its own entries, so require ours, not a count
+check("log has our 3 entries (#{log_text.split("\n").length} total)",
+      log_text.include?('TEMP1 = 9.0 is RED_HIGH') &&
+      log_text.include?('TEMP2 = 3.0 is YELLOW_HIGH') &&
+      log_text.include?('INST MECH is STALE'))
+check('log entries are timestamped', log_text =~ %r{^\d{4}/\d{2}/\d{2} })
 
 # Without a CmdTlmServer the limits thread keeps calling reset(), which clears
-# the item panel. Stop the threads so the items we add below stay put.
+# the item panel. Stop both threads and let every callback they already queued
+# to the main thread run, so the items added below stay put.
 lm.instance_variable_set(:@cancel_thread, true)
 lm.instance_variable_get(:@limits_sleeper).cancel
 lm.instance_variable_get(:@value_sleeper).cancel
+[lm.instance_variable_get(:@limits_thread),
+ lm.instance_variable_get(:@value_thread)].each do |thread|
+  100.times do
+    break unless thread.alive?
+    APP.processEvents # lets blocking execute_in_main_thread callbacks finish
+    sleep 0.02
+  end
+end
+check('limits thread stopped', !lm.instance_variable_get(:@limits_thread).alive?)
+check('value thread stopped', !lm.instance_variable_get(:@value_thread).alive?)
 pump(20)
 
 # Out of limits items and stale packets build real telemetry widgets
