@@ -1,4 +1,4 @@
-require_relative 'test_helper'
+require_relative 'helper'
 
 require 'cosmos/tools/launcher/launcher_config'
 require 'cosmos/tools/launcher/launcher_tool'

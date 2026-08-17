@@ -9,8 +9,11 @@
 # attribution addendums as found in the LICENSE.txt
 
 require 'cosmos'
-require 'cosmos/ext/line_graph' # Only supported with MRI
+# Must come before cosmos/ext/line_graph: the extension re-declares the
+# qtbindings class hierarchy (Qt::Base, Qt::Widget < Qt::Base) and can only
+# agree with the real bindings if they are already loaded.
 require 'cosmos/gui/qt'
+require 'cosmos/ext/line_graph' # Only supported with MRI
 require 'cosmos/gui/dialogs/exception_dialog'
 require 'cosmos/gui/line_graph/lines'
 require 'cosmos/gui/line_graph/line_graph_drawing'

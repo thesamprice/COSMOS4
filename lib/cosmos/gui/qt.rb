@@ -636,14 +636,33 @@ class Qt::ColorListWidget < Qt::ListWidget
 end
 
 class Qt::Painter
+  # The new bindings define setPen/setBrush directly on this class, so `super`
+  # from a reopen has nothing to call. Wrap via alias instead (same pattern as
+  # Qt::TreeWidgetItem above), covering every spelling the bindings register.
+  %w(setPen set_pen pen=).each do |meth|
+    alias_method("qt6_#{meth}", meth) if method_defined?(meth)
+  end
+  %w(setBrush set_brush brush=).each do |meth|
+    alias_method("qt6_#{meth}", meth) if method_defined?(meth)
+  end
+
   def setPen(pen_color)
-    super(Cosmos::getColor(pen_color))
+    qt6_setPen(Cosmos::getColor(pen_color))
     @pen_color = pen_color
   end
+  alias_method :set_pen, :setPen
+  alias_method :pen=, :setPen
+
   def setBrush(brush)
-    super(Cosmos::getBrush(brush))
+    qt_brush = Cosmos::getBrush(brush)
+    # Callers clear the fill with setBrush(nil). Qt 4 accepted that; the Qt 6
+    # bindings type-check the QBrush reference, so use the Qt::NoBrush style
+    # overload which is what "no brush" means in Qt.
+    qt6_setBrush(qt_brush || Qt::NoBrush)
     @brush = brush
   end
+  alias_method :set_brush, :setBrush
+  alias_method :brush=, :setBrush
 
   def addLineColor(x, y, w, h, color = Cosmos::BLACK)
     setPen(color) if color != @pen_color
