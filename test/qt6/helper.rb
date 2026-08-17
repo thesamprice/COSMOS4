@@ -4,6 +4,7 @@ ENV['QT_QPA_PLATFORM'] = 'offscreen'
 
 require 'cosmos'
 require 'cosmos/gui/qt'
+require 'cosmos/gui/dialogs/splash' # referenced by the modal closer below
 
 APP = Qt::Application.new
 
@@ -13,7 +14,11 @@ MODALS_SEEN = []
 modal_closer = Qt::Timer.new
 modal_closer.on_timeout do
   m = Qt::Application.activeModalWidget
-  if m
+  # Cosmos::Splash is modal but self-dismissing: it runs the tool's startup
+  # work (System.load, config parsing) on a worker thread and closes itself
+  # when that finishes. Killing it aborts the load and leaves the tool
+  # half-initialized, so leave splashes alone and only dismiss real dialogs.
+  if m && !m.is_a?(Cosmos::Splash::SplashDialogBox)
     MODALS_SEEN << m.class.to_s
     m.respond_to?(:done) ? m.done(0) : m.close
   end

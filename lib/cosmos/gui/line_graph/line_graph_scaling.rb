@@ -130,8 +130,13 @@ module Cosmos
       y_max = 1
       y_min = -1
 
-      # Ensure we have a valid range of values
-      if value_range.size
+      # Ensure we have a valid range of values.
+      # Lines#y_value_range builds (mins.min...maxs.max), which is (nil...nil)
+      # until the graph has data. Ruby <= 3.3 returned nil from Range#size for
+      # such a range, so this guard fell through to the +/-1 defaults; Ruby 3.4+
+      # raises TypeError ("can't iterate from NilClass") instead. Test the
+      # endpoints directly, which is what the guard always meant.
+      if value_range.begin && value_range.end
         y_min = value_range.first
         y_max = value_range.last
 

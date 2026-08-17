@@ -348,7 +348,7 @@ class Qt::TreeWidgetItem
   # direct methods on this class, so wrap via alias rather than super
   # (which the old method_missing-based qtbindings dispatch allowed).
   %w(background checkState font foreground icon statusTip sizeHint text toolTip whatsThis).each do |meth|
-    if method_defined?(meth)
+    if method_defined?(meth) && !method_defined?("qt6_#{meth}")
       alias_method("qt6_#{meth}", meth)
       define_method(meth) { |column = 0| send("qt6_#{meth}", column) }
     end
@@ -639,11 +639,10 @@ class Qt::Painter
   # The new bindings define setPen/setBrush directly on this class, so `super`
   # from a reopen has nothing to call. Wrap via alias instead (same pattern as
   # Qt::TreeWidgetItem above), covering every spelling the bindings register.
-  %w(setPen set_pen pen=).each do |meth|
-    alias_method("qt6_#{meth}", meth) if method_defined?(meth)
-  end
-  %w(setBrush set_brush brush=).each do |meth|
-    alias_method("qt6_#{meth}", meth) if method_defined?(meth)
+  %w(setPen set_pen pen= setBrush set_brush brush=).each do |meth|
+    if method_defined?(meth) && !method_defined?("qt6_#{meth}")
+      alias_method("qt6_#{meth}", meth)
+    end
   end
 
   def setPen(pen_color)

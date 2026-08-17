@@ -1,0 +1,6 @@
+INTERFACE INST_INT interface.rb
+  TARGET INST
+  PROTOCOL READ_WRITE OverrideProtocol
+ROUTER ROUTE interface.rb
+BACKGROUND_TASK example_background_task1.rb
+BACKGROUND_TASK example_background_task2.rb
