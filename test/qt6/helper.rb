@@ -12,6 +12,14 @@ APP = Qt::Application.new
 # Auto-dismiss any modal dialog that appears (QMessageBox ignores close(),
 # so prefer done(0))
 MODALS_SEEN = []
+
+# Opt-in escape hatch from the blanket dismissal below. A test that needs a
+# dialog *accepted* with real input (rather than cancelled) pushes a lambda
+# here; it is called with the modal widget and returns true to claim it, which
+# suppresses the default done(0). Empty by default, so tests that do not
+# register anything behave exactly as before.
+MODAL_HANDLERS = []
+
 modal_closer = Qt::Timer.new
 modal_closer.on_timeout do
   m = Qt::Application.activeModalWidget
@@ -36,8 +44,10 @@ modal_closer.on_timeout do
       m.close_done
     end
   elsif m && !m.is_a?(Cosmos::Splash::SplashDialogBox)
-    MODALS_SEEN << m.class.to_s
-    m.respond_to?(:done) ? m.done(0) : m.close
+    unless MODAL_HANDLERS.any? { |handler| handler.call(m) }
+      MODALS_SEEN << m.class.to_s
+      m.respond_to?(:done) ? m.done(0) : m.close
+    end
   end
 end
 modal_closer.start(50)
