@@ -50,3 +50,4 @@ install/tools/mac/TlmViewer.app/Contents/MacOS/TlmViewer
 test/performance/outputs/tmp
 vendor/bundle/
 .bundle/
+*_segfault.txt
