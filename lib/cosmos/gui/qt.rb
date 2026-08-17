@@ -237,7 +237,12 @@ end
 class Qt::Dialog
   def initialize(parent = Qt::Application.activeWindow,
                  flags = (Qt::WindowTitleHint | Qt::WindowSystemMenuHint))
+    # Subclasses (e.g. QMessageBox) may not have a (parent, flags) C++
+    # constructor; fall back to parent-only and set the flags after
     super(parent, flags)
+  rescue ArgumentError
+    super(parent)
+    setWindowFlags(flags)
   end
 end
 
