@@ -20,8 +20,36 @@ MODALS_SEEN = []
 # register anything behave exactly as before.
 MODAL_HANDLERS = []
 
+# Right-click context menus are the other kind of window that stops a headless
+# run dead. Qt::Menu#exec is a Ruby-driven loop over popup() (see qt6.rb), so
+# it no longer blocks the GVL -- but nothing headless will ever dismiss the
+# menu, so the loop spins forever unless someone closes it.
+#
+# Unlike the modal arm below, this one is unconditional rather than opt-in.
+# Dismissing a modal dialog is a real answer ("cancel"), so a test may
+# legitimately want to give a different one; an unattended popup menu is never
+# anything but a hang, and no test opens one it does not intend to drive.
+# POPUP_HANDLERS is the same escape hatch as MODAL_HANDLERS for a test that
+# wants to choose an action instead: push a lambda, return true to claim the
+# menu (having triggered whatever it wants) and suppress the default close.
+#
+# Scoped to Qt::Menu on purpose. Qt::Application.activePopupWidget also
+# reports QCompleter's completion list, which script_runner and config_editor
+# pop up while text is being typed; those dismiss themselves and closing them
+# from here would change what those tests exercise.
+POPUPS_SEEN = []
+POPUP_HANDLERS = []
+
 modal_closer = Qt::Timer.new
 modal_closer.on_timeout do
+  popup = Qt::Application.activePopupWidget
+  if popup.is_a?(Qt::Menu)
+    unless POPUP_HANDLERS.any? { |handler| handler.call(popup) }
+      POPUPS_SEEN << popup.title.to_s
+      popup.close
+    end
+  end
+
   m = Qt::Application.activeModalWidget
   # Cosmos::Splash is modal but self-dismissing: it runs the tool's startup
   # work (System.load, config parsing) on a worker thread and closes itself
@@ -51,6 +79,28 @@ modal_closer.on_timeout do
   end
 end
 modal_closer.start(50)
+
+# The telemetry log tlm_extractor, tlm_grapher, replay and data_viewer read
+# back. Those four used to glob Cosmos::System.paths['LOGS'] directly, which
+# only holds anything on a machine that has run the demo CmdTlmServer long
+# enough to produce one -- so from a clean checkout all four failed at require
+# time. Prefer the newest local log when there is one, so behaviour on a
+# developer machine is unchanged, and otherwise fall back to the committed
+# fixture (see fixtures/build_tlm_log.rb for what is in it and how to rebuild
+# it). COSMOS_QT6_FORCE_FIXTURE=1 ignores the local log, which is how the
+# fixture path gets exercised on a machine that has one.
+FIXTURE_TLM_LOG = File.join(__dir__, 'fixtures', 'qt6_demo_tlm.bin')
+
+def tlm_log_file
+  unless ENV['COSMOS_QT6_FORCE_FIXTURE'] == '1'
+    newest = Dir[File.join(Cosmos::System.paths['LOGS'], '*_tlm.bin')].sort.last
+    return newest if newest && File.size(newest) > 0
+  end
+  unless File.exist?(FIXTURE_TLM_LOG)
+    raise "no local *_tlm.bin and no fixture at #{FIXTURE_TLM_LOG}"
+  end
+  FIXTURE_TLM_LOG
+end
 
 def default_tool_options
   require 'cosmos/gui/qt_tool'

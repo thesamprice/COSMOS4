@@ -2,8 +2,7 @@ require_relative 'helper'
 
 require 'cosmos/tools/data_viewer/data_viewer'
 
-LOG_FILE = Dir[File.join(Cosmos::System.paths['LOGS'], '*_tlm.bin')].sort.last
-raise 'no *_tlm.bin in the demo log directory' unless LOG_FILE
+LOG_FILE = tlm_log_file
 
 # handle_open_log_file asks for the files through a modal PacketLogDialog.
 # helper.rb's modal closer would answer it Rejected and the playback would

@@ -269,6 +269,56 @@ tm.file_save
 pump(30, 0.05)
 check('final save leaves the window unmarked', tm.windowTitle == 'Table Manager')
 
+# ---------------------------------------------------------------------------
+# Right-click context menu. context_menu() ends in Qt::Menu#exec, which used
+# to be a blocking C++ nested loop -- undismissable headless and holding the
+# GVL while it ran. It is now the Ruby-driven popup() loop in qt6.rb, so a
+# headless run can both survive it and drive it.
+# ---------------------------------------------------------------------------
+mc = tm.tabbook.tab('MC CONFIGURATION')
+point = mc.visualItemRect(mc.item(plain_row, 0)).center
+check('the context menu point lands on an item', !mc.itemAt(point).nil?)
+
+# Unattended: the helper's popup arm closes the menu, so exec returns nil and
+# context_menu comes back instead of hanging.
+before_popups = POPUPS_SEEN.length
+started = Time.now
+tm.send(:context_menu, point)
+elapsed = Time.now - started
+check("unattended context menu closes itself (#{elapsed.round(2)}s)", elapsed < 5)
+check('the popup arm saw the menu', POPUPS_SEEN.length == before_popups + 1)
+check('a dismissed menu changes nothing', mc.item(plain_row, 0).text == '6000')
+
+# Opt-in: claim the menu through POPUP_HANDLERS and fire one of its actions
+mc.item(plain_row, 0).setText('4242')
+pump(10)
+check("cell edited before driving the menu (#{mc.item(plain_row, 0).text})",
+      mc.item(plain_row, 0).text == '4242')
+
+titles = nil
+POPUP_HANDLERS << lambda do |menu|
+  titles = menu.actions.map { |action| action.text }
+  chosen = menu.actions.find { |action| action.text == 'Default' }
+  chosen.trigger if chosen
+  menu.close
+  true
+end
+begin
+  tm.send(:context_menu, point)
+ensure
+  POPUP_HANDLERS.clear
+end
+check("context menu offers #{titles.inspect}", titles == ['Details', 'Default'])
+pump(10)
+check("the Default action restored the default (#{mc.item(plain_row, 0).text})",
+      mc.item(plain_row, 0).text == '6000')
+check('the Default action reached the packet',
+      tm.core.config.table('MC CONFIGURATION').read('SCRUB REGION 2 THROTTLE COUNT') == 6000)
+
+tm.file_save
+pump(30, 0.05)
+check('context menu work leaves the window unmarked', tm.windowTitle == 'Table Manager')
+
 tm.close
 pump(20)
 puts 'TEST_TABLE_MANAGER OK'

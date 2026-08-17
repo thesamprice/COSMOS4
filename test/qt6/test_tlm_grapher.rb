@@ -227,36 +227,32 @@ File.delete(config_file)
 # Offline graphing: the Open Log path runs the same config.process_packet over
 # a packet log instead of a socket.
 # ---------------------------------------------------------------------------
-log_file = Dir[File.join(Cosmos::System.paths['LOGS'], '*_tlm.bin')].sort.last
-if log_file
-  config.reset_data_objects
-  check('reset cleared the data objects',
-        plot.data_objects.all? { |d| d.x_values.empty? })
+log_file = tlm_log_file
+config.reset_data_objects
+check('reset cleared the data objects',
+      plot.data_objects.all? { |d| d.x_values.empty? })
 
-  logfile_thread = Cosmos::TabbedPlotsLogfileThread.new([log_file],
-                                                        Cosmos::PacketLogReader.new,
-                                                        config, nil)
-  waited = 0.0
-  until logfile_thread.done? || waited > 60.0
-    pump(5, 0.02)
-    waited += 0.1
-  end
-  check('log file thread finished', logfile_thread.done?)
-  check("log file processed cleanly #{logfile_thread.errors.map(&:message).inspect}",
-        logfile_thread.errors.empty?)
-  check("log file produced samples #{plot.data_objects.map { |d| d.x_values.length }.inspect}",
-        plot.data_objects.all? { |d| d.x_values.length > 10 })
-
-  plots.instance_variable_get(:@tab_book).setCurrentIndex(0)
-  plots.redraw_plots(true, true)
-  pump(30, 0.05)
-  screenshot(tg, '/tmp/cosmos_tlm_grapher_logfile_qt6.png')
-  log_blue, log_red = line_pixels(plot.gui_object)
-  check("log file data drawn (#{log_blue} blue / #{log_red} red px)",
-        log_blue > 300 && log_red > 300)
-else
-  puts 'skip: no *_tlm.bin in the demo log directory'
+logfile_thread = Cosmos::TabbedPlotsLogfileThread.new([log_file],
+                                                      Cosmos::PacketLogReader.new,
+                                                      config, nil)
+waited = 0.0
+until logfile_thread.done? || waited > 60.0
+  pump(5, 0.02)
+  waited += 0.1
 end
+check('log file thread finished', logfile_thread.done?)
+check("log file processed cleanly #{logfile_thread.errors.map(&:message).inspect}",
+      logfile_thread.errors.empty?)
+check("log file produced samples #{plot.data_objects.map { |d| d.x_values.length }.inspect}",
+      plot.data_objects.all? { |d| d.x_values.length > 10 })
+
+plots.instance_variable_get(:@tab_book).setCurrentIndex(0)
+plots.redraw_plots(true, true)
+pump(30, 0.05)
+screenshot(tg, '/tmp/cosmos_tlm_grapher_logfile_qt6.png')
+log_blue, log_red = line_pixels(plot.gui_object)
+check("log file data drawn (#{log_blue} blue / #{log_red} red px)",
+      log_blue > 300 && log_red > 300)
 
 # ---------------------------------------------------------------------------
 # Structure edits. The menu handlers wrap these in confirmation dialogs; drive

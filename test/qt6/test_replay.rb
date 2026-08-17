@@ -25,8 +25,7 @@ options.config_dir = File.join(Cosmos::USERPATH, 'config', 'tools', 'cmd_tlm_ser
 PACKET_LOG_GLOB = File.join(Cosmos::System.paths['LOGS'], '*_{tlm,cmd}.bin')
 PRE_EXISTING_PACKET_LOGS = Dir[PACKET_LOG_GLOB]
 
-log_file = Dir[File.join(Cosmos::System.paths['LOGS'], '*_tlm.bin')].sort.last
-raise 'no demo *_tlm.bin log to replay' unless log_file
+log_file = tlm_log_file
 
 replay = nil
 begin

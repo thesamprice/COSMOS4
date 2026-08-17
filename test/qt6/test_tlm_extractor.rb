@@ -89,8 +89,7 @@ check('rejecting the editor left the list alone', item_list.count == 14)
 # It runs the work on a ProgressDialog worker thread; helper.rb clicks Done
 # once the dialog enables it, which is what lets execute() return.
 # ---------------------------------------------------------------------------
-log_file = Dir[File.join(Cosmos::System.paths['LOGS'], '*_tlm.bin')].sort.last
-raise 'no *_tlm.bin in the demo log directory' unless log_file
+log_file = tlm_log_file
 
 plf = te.instance_variable_get(:@packet_log_frame)
 plf.instance_variable_get(:@filenames).addItem(log_file)
