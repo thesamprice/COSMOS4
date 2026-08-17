@@ -19,11 +19,23 @@ modal_closer.on_timeout do
   # work (System.load, config parsing) on a worker thread and closes itself
   # when that finishes. Killing it aborts the load and leaves the tool
   # half-initialized, so leave splashes alone and only dismiss real dialogs.
-  # ProgressDialog works the same way -- ScriptRunnerFrame.instrument_script
-  # runs the whole lexer pass inside one and calls close_done at the end, so
-  # dismissing it early kills instrumentation and the script never runs.
-  if m && !m.is_a?(Cosmos::Splash::SplashDialogBox) &&
-     !m.is_a?(Cosmos::ProgressDialog)
+  # ProgressDialog runs its work on a worker thread the same way and needs the
+  # separate handling below rather than a blind done(0).
+  if m.is_a?(Cosmos::ProgressDialog)
+    # A ProgressDialog runs its work on a worker thread and then calls
+    # #complete, which only ENABLES the Done button -- the dialog stays up
+    # until the user clicks it, so ProgressDialog.execute (and with it the
+    # tool method that called it) never returns on its own. Click Done for
+    # the user, but only once the button is enabled, which is the worker
+    # saying it has finished. Dialogs built with show_done = false, such as
+    # ScriptRunnerFrame.instrument_script's, have no button here and still
+    # close themselves via close_done, so they are left alone.
+    done_button = m.instance_variable_get(:@done_button)
+    if done_button && done_button.enabled?
+      MODALS_SEEN << m.class.to_s
+      m.close_done
+    end
+  elsif m && !m.is_a?(Cosmos::Splash::SplashDialogBox)
     MODALS_SEEN << m.class.to_s
     m.respond_to?(:done) ? m.done(0) : m.close
   end
