@@ -23,28 +23,28 @@ module Cosmos
   # connected descriptor and does the reading and writing from threads that
   # never take the GVL.
   #
+  # Everything the two byte stream transports do the same way - options,
+  # statistics, read, write, flush, disconnect - lives in
+  # {Cosmos::BufferedIO::Transport}. What is left here is what is specific to a
+  # socket: probing a descriptor with remote_address, and the :adopt_write_only
+  # switch the TCP server needs.
+  #
   # Everything else (return values, exceptions, timeouts) matches
   # {TcpipSocketStream} so protocols and interfaces see no difference. If a
   # channel cannot be created the stock Ruby implementation is used.
   module BufferedSocketStream
-    # Bytes of user space ring buffer per read channel
-    DEFAULT_RING_BYTES = 16 * 1024 * 1024
-    # Ring for a channel that only ever writes
-    WRITE_ONLY_RING_BYTES = 65536
-    # Seconds to let queued writes drain during disconnect
-    DEFAULT_FLUSH_TIMEOUT = 1.0
+    include BufferedIO::Transport
 
-    # @return [Cosmos::BufferedIO::StreamChannel|nil] Channel draining the read socket
-    attr_reader :read_channel
-    # @return [Cosmos::BufferedIO::StreamChannel|nil] Channel filling the write socket
-    attr_reader :write_channel
+    # Errors that mean the socket went away underneath us. The stock
+    # {TcpipSocketStream} returns an empty string for these and lets the
+    # interface handle the disconnect.
+    SOCKET_READ_ERRORS = [IOError, Errno::ECONNRESET, Errno::ECONNABORTED,
+                          Errno::ENOTSOCK, Errno::EBADF, Errno::ENOTCONN,
+                          Errno::EPIPE].freeze
 
-    # Configure the buffered layer. Called from the including class's
-    # constructor.
+    # (see BufferedIO::Transport#setup_buffered_options)
     #
-    # @param options [Hash] :ring_bytes, :write_high_water, :write_policy
-    #   (:block or :raise), :overflow_policy (:backpressure, :drop_oldest or
-    #   :drop_newest), :flush_timeout, :adopt_write_only
+    # @param options [Hash] Adds :adopt_write_only to the shared options
     def setup_buffered_options(options = {})
       options ||= {}
       # Whether a socket that is only ever written (a separate write port) gets
@@ -53,63 +53,7 @@ module Cosmos
       # a C++ reader thread on the same descriptor would eat the EOF and the
       # client would never be reaped. See TcpipServerInterface.
       @adopt_write_only = options.key?(:adopt_write_only) ? !!options[:adopt_write_only] : true
-      @ring_bytes = (options[:ring_bytes] || DEFAULT_RING_BYTES).to_i
-      # Bytes returned by one read. A read only ever returns what is actually
-      # buffered, so a large cap costs nothing when the stream is keeping up
-      # and lets a starved interface thread drain the whole backlog in a single
-      # GVL acquisition instead of one 64 KiB slice per scheduler round trip.
-      @read_chunk_bytes = (options[:read_chunk_bytes] || @ring_bytes).to_i
-      @write_high_water = options[:write_high_water]
-      @write_policy = options[:write_policy] || :block
-      # Streams default to back pressure: TCP is lossless today and must stay
-      # lossless. Drop policies are for the transports the kernel already drops
-      # (UDP, serial).
-      @overflow_policy = options[:overflow_policy] || :backpressure
-      @flush_timeout = options[:flush_timeout] || DEFAULT_FLUSH_TIMEOUT
-      @read_channel = nil
-      @write_channel = nil
-      @last_read_time_f = nil
-    end
-
-    # @return [Time|nil] Time the first byte of the last chunk returned by
-    #   {#read} was received by the C++ reader thread. This is a kernel handoff
-    #   time taken without the GVL, so it is not skewed by Ruby scheduling.
-    def last_read_time
-      @last_read_time_f ? Time.at(@last_read_time_f).sys : nil
-    end
-
-    # @return [Float|nil] {#last_read_time} as seconds since the epoch
-    def last_read_time_f
-      @last_read_time_f
-    end
-
-    # @return [Boolean] Whether this stream is actually running through the
-    #   buffered C++ backend
-    def buffered?
-      !!(@read_channel or @write_channel)
-    end
-
-    # @return [Hash] Buffered channel statistics for the CmdTlmServer counters
-    #   (see BufferedIO.empty_stats). :drop_count stays zero under the default
-    #   :backpressure policy - TCP is lossless and must stay lossless - so
-    #   :stall_count is the counter that says Ruby is falling behind.
-    def buffered_stats
-      stats = BufferedIO.empty_stats
-      return stats unless @read_channel or @write_channel
-      stats[:buffered] = true
-      if @read_channel
-        stats[:bytes_read] = @read_channel.bytes_read
-        stats[:drop_count] = @read_channel.drop_count
-        stats[:stall_count] = @read_channel.stall_count
-        stats[:buffered_bytes] = @read_channel.buffered_bytes
-        stats[:high_water] = @read_channel.high_water
-        stats[:ring_bytes] = @read_channel.ring_bytes
-      end
-      if @write_channel
-        stats[:bytes_written] = @write_channel.bytes_written
-        stats[:pending_write_bytes] = @write_channel.pending_write_bytes
-      end
-      stats
+      super(options)
     end
 
     # Connect the sockets (super) and then adopt their descriptors
@@ -119,136 +63,41 @@ module Cosmos
       @connected
     end
 
-    # (see TcpipSocketStream#read)
-    def read
-      raise "Attempt to read from write only stream" unless @read_socket
-      return super() unless @read_channel
-
-      begin
-        result = @read_channel.read_with_time(@read_timeout, @read_chunk_bytes)
-        raise Timeout::Error, "Read Timeout" if result.nil?
-        data, @last_read_time_f = result
-        data
-      rescue EOFError
-        # The peer closed cleanly. TcpipSocketStream raises this too.
-        raise
-      rescue IOError, Errno::ECONNRESET, Errno::ECONNABORTED, Errno::ENOTSOCK,
-             Errno::EBADF, Errno::ENOTCONN, Errno::EPIPE
-        # The socket went away underneath us. TcpipSocketStream returns an
-        # empty string here and lets the interface handle the disconnect.
-        ''
-      end
-    end
-
-    # (see TcpipSocketStream#read_nonblock)
-    def read_nonblock
-      return super() unless @read_channel
-
-      begin
-        result = @read_channel.read_with_time(0)
-        return '' if result.nil?
-        data, @last_read_time_f = result
-        data
-      rescue EOFError
-        # The peer closed cleanly. TcpipSocketStream raises this too.
-        raise
-      rescue IOError, Errno::ECONNRESET, Errno::ECONNABORTED, Errno::ENOTSOCK,
-             Errno::EBADF, Errno::ENOTCONN, Errno::EPIPE
-        ''
-      end
-    end
-
-    # (see TcpipSocketStream#write)
-    def write(data)
-      raise "Attempt to write to read only stream" unless @write_socket
-      return super(data) unless @write_channel
-
-      # The C++ writer thread owns the syscall - this only queues, in order.
-      result = @write_channel.write(data, @write_timeout)
-      raise Timeout::Error, "Write Timeout" if result == false
-      nil
-    end
-
-    # Wait for all queued writes to reach the kernel
-    #
-    # @param timeout [Float|nil] Seconds to wait, nil to wait forever
-    # @return [Boolean] Whether everything was written
-    def flush(timeout = nil)
-      return true unless @write_channel
-      @write_channel.flush(timeout)
-    end
-
-    # @return [Boolean] Whether the stream is connected
-    def connected?
-      return false unless super()
-      return true unless @read_channel or @write_channel
-      channels.each { |channel| return false if channel.stopped? }
-      true
-    end
-
-    # Stop the channels then let the stock implementation close the sockets
-    def disconnect
-      channels.each do |channel|
-        begin
-          channel.disconnect(@flush_timeout)
-        rescue Exception
-          # Nothing useful to do if the channel is already gone
-        end
-      end
-      @read_channel = nil
-      @write_channel = nil
-      super()
-    end
-
     protected
 
-    # @return [Array<Cosmos::BufferedIO::StreamChannel>] Unique live channels
-    def channels
-      [@read_channel, @write_channel].compact.uniq { |channel| channel.object_id }
+    # (see BufferedIO::Transport#buffered_readable?)
+    def buffered_readable?
+      !!@read_socket
     end
 
-    # Hand the connected descriptors to the C++ channels. Any failure falls
-    # back to the stock Ruby implementation.
-    def adopt_buffered_channels
-      return unless BufferedIO.available?
-      return if @read_channel or @write_channel
-
-      begin
-        if @read_socket and adoptable?(@read_socket)
-          @read_channel = BufferedIO::StreamChannel.adopt(@read_socket.fileno, @ring_bytes)
-        end
-        if @write_socket and adoptable?(@write_socket)
-          if @read_socket and @write_socket.equal?(@read_socket) and @read_channel
-            @write_channel = @read_channel
-          elsif @adopt_write_only
-            # A write only socket never delivers telemetry, so it does not need
-            # a telemetry sized ring.
-            @write_channel = BufferedIO::StreamChannel.adopt(@write_socket.fileno,
-                                                             WRITE_ONLY_RING_BYTES)
-          end
-        end
-        channels.each do |channel|
-          channel.write_policy = @write_policy if @write_policy
-          channel.write_high_water = @write_high_water if @write_high_water
-          channel.overflow_policy = @overflow_policy if @overflow_policy
-        end
-      rescue Exception => error
-        # Never let the buffered path break a connection that Ruby can serve
-        BufferedIO.log_fallback(self.class.name)
-        Logger.warn("#{self.class.name}: #{error.class}: #{error.message}") if defined?(Logger)
-        release_channels
-      end
+    # (see BufferedIO::Transport#buffered_writable?)
+    def buffered_writable?
+      !!@write_socket
     end
 
-    def release_channels
-      channels.each do |channel|
-        begin
-          channel.disconnect(0)
-        rescue Exception
+    # (see BufferedIO::Transport#buffered_read_errors)
+    def buffered_read_errors
+      SOCKET_READ_ERRORS
+    end
+
+    # Adopt the connected sockets. Called inside the fallback-on-any-failure
+    # wrapper in {BufferedIO::Transport#adopt_buffered_channels}.
+    def adopt_channels
+      if @read_socket and adoptable?(@read_socket)
+        @read_channel = BufferedIO::StreamChannel.adopt(@read_socket.fileno, @ring_bytes)
+        @read_channel.overflow_policy = @overflow_policy if @overflow_policy
+      end
+      if @write_socket and adoptable?(@write_socket)
+        if @read_socket and @write_socket.equal?(@read_socket) and @read_channel
+          @write_channel = @read_channel
+        elsif @adopt_write_only
+          # A write only socket never delivers telemetry, so it does not need
+          # a telemetry sized ring.
+          @write_channel = BufferedIO::StreamChannel.adopt(@write_socket.fileno,
+                                                           WRITE_ONLY_RING_BYTES)
+          @write_channel.overflow_policy = @overflow_policy if @overflow_policy
         end
       end
-      @read_channel = nil
-      @write_channel = nil
     end
 
     # Only a real, connected socket is adopted. Anything else (a test double,

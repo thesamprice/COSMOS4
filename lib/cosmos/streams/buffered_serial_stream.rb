@@ -29,231 +29,76 @@ module Cosmos
   # C++ thread moves that cliff from milliseconds of starvation to minutes of
   # it.
   #
+  # Everything the two byte stream transports do the same way - options,
+  # statistics, read, write, flush, disconnect - lives in
+  # {Cosmos::BufferedIO::Transport}. What is left here is what is specific to a
+  # tty: finding the descriptor behind a {SerialDriver}, adopting it as soon as
+  # the port is open (a {SerialStream} is connected the moment it is created),
+  # the write mutex, and the drop policy for a port nothing reads.
+  #
   # Everything else (return values, exceptions, timeouts) matches
   # {SerialStream}, so protocols and interfaces see no difference. If the
   # descriptor cannot be adopted - a mocked driver, Win32SerialDriver, JRuby,
   # an unbuilt extension - the stock pure Ruby implementation is used unchanged.
   module BufferedSerialTransport
-    # Bytes of user space ring buffer for the read port
-    DEFAULT_RING_BYTES = 16 * 1024 * 1024
-    # Ring for a port that is only ever written. Nothing reads this ring, so it
-    # only exists to keep the descriptor drained.
-    WRITE_ONLY_RING_BYTES = 65536
-    # Seconds to let queued writes drain during disconnect
-    DEFAULT_FLUSH_TIMEOUT = 1.0
+    include BufferedIO::Transport
 
-    # @return [Cosmos::BufferedIO::StreamChannel|nil] Channel draining the read port
-    attr_reader :read_channel
-    # @return [Cosmos::BufferedIO::StreamChannel|nil] Channel filling the write port
-    attr_reader :write_channel
-
-    # Configure the buffered layer and adopt the descriptors. Called from the
-    # including class's constructor, because a {SerialStream} is connected the
-    # moment it is created.
+    # (see BufferedIO::Transport#setup_buffered_options)
     #
-    # @param options [Hash] :ring_bytes, :read_chunk_bytes, :write_high_water,
-    #   :write_policy (:block or :raise), :overflow_policy (:backpressure,
-    #   :drop_oldest or :drop_newest), :flush_timeout
+    # Also adopts the descriptors, because a {SerialStream} is connected the
+    # moment it is created - there is no later connect to adopt from.
     def setup_buffered_options(options = {})
-      options ||= {}
-      @ring_bytes = (options[:ring_bytes] || DEFAULT_RING_BYTES).to_i
-      # Bytes returned by one read. A read only ever returns what is actually
-      # buffered, so a large cap costs nothing when the port is keeping up and
-      # lets a starved interface thread drain the whole backlog in a single GVL
-      # acquisition instead of one 64 KiB slice per scheduler round trip.
-      @read_chunk_bytes = (options[:read_chunk_bytes] || @ring_bytes).to_i
-      @write_high_water = options[:write_high_water]
-      @write_policy = options[:write_policy] || :block
-      # See doc/buffered_io_design.md: serial defaults to back pressure, not to
-      # a drop policy. Dropping bytes out of the middle of a byte stream
-      # desynchronizes framing, and back pressure is what keeps RTS/CTS flow
-      # control working. Drops remain available per interface.
-      @overflow_policy = options[:overflow_policy] || :backpressure
-      @flush_timeout = options[:flush_timeout] || DEFAULT_FLUSH_TIMEOUT
-      @read_channel = nil
-      @write_channel = nil
-      @last_read_time_f = nil
+      super(options)
       adopt_buffered_channels()
-    end
-
-    # @return [Boolean] Whether this stream is actually running through the
-    #   buffered C++ backend
-    def buffered?
-      !!(@read_channel or @write_channel)
-    end
-
-    # @return [Time|nil] Time the first byte of the last chunk returned by
-    #   {#read} arrived from the tty. Stamped by the C++ reader thread without
-    #   the GVL, so it is not skewed by Ruby scheduling.
-    def last_read_time
-      @last_read_time_f ? Time.at(@last_read_time_f).sys : nil
-    end
-
-    # @return [Float|nil] {#last_read_time} as seconds since the epoch
-    def last_read_time_f
-      @last_read_time_f
-    end
-
-    # @return [Hash] Buffered channel statistics for the CmdTlmServer counters.
-    #   :stall_count is the serial specific one: under :backpressure nothing is
-    #   ever dropped by us, so a rising stall count is the early warning that
-    #   Ruby is not draining and the tty input buffer is next in line.
-    def buffered_stats
-      stats = BufferedIO.empty_stats
-      return stats unless @read_channel or @write_channel
-      stats[:buffered] = true
-      if @read_channel
-        stats[:bytes_read] = @read_channel.bytes_read
-        stats[:drop_count] = @read_channel.drop_count
-        stats[:buffered_bytes] = @read_channel.buffered_bytes
-        stats[:high_water] = @read_channel.high_water
-        stats[:stall_count] = @read_channel.stall_count
-        stats[:ring_bytes] = @read_channel.ring_bytes
-      end
-      if @write_channel
-        stats[:bytes_written] = @write_channel.bytes_written
-        stats[:pending_write_bytes] = @write_channel.pending_write_bytes
-      end
-      stats
-    end
-
-    # (see SerialStream#read)
-    def read
-      raise "Attempt to read from write only stream" unless @read_serial_port
-      return super() unless @read_channel
-
-      begin
-        result = @read_channel.read_with_time(@read_timeout, @read_chunk_bytes)
-        # PosixSerialDriver#read raises Timeout::Error when the read times out
-        raise Timeout::Error, "Read Timeout" if result.nil?
-        data, @last_read_time_f = result
-        data
-      rescue EOFError
-        # The other end of the port went away. read_nonblock raises this too.
-        raise
-      rescue IOError
-        # The channel was disconnected underneath us (another thread called
-        # disconnect). An empty read is how {StreamInterface#read_interface}
-        # is told to shut the interface down, which is what the stock stream
-        # ends up doing when its port is closed mid read.
-        ''
-      end
-    end
-
-    # (see SerialStream#read_nonblock)
-    def read_nonblock
-      raise "Attempt to read from write only stream" unless @read_serial_port
-      return super() unless @read_channel
-
-      begin
-        result = @read_channel.read_with_time(0, @read_chunk_bytes)
-        # PosixSerialDriver#read_nonblock returns '' when nothing is waiting
-        return '' if result.nil?
-        data, @last_read_time_f = result
-        data
-      rescue EOFError
-        raise
-      rescue IOError
-        ''
-      end
-    end
-
-    # (see SerialStream#write)
-    def write(data)
-      raise "Attempt to write to read only stream" unless @write_serial_port
-      return super(data) unless @write_channel
-
-      # The C++ writer thread owns the syscall - this only queues, in order.
-      # The mutex is kept so commands from more than one tool interleave
-      # exactly as they do today.
-      @write_mutex.synchronize do
-        result = @write_channel.write(data, @write_timeout)
-        # PosixSerialDriver#write raises Timeout::Error the same way
-        raise Timeout::Error, "Write Timeout" if result == false
-      end
-      nil
-    end
-
-    # Wait for all queued writes to reach the kernel
-    #
-    # @param timeout [Float|nil] Seconds to wait, nil to wait forever
-    # @return [Boolean] Whether everything was written
-    def flush(timeout = nil)
-      return true unless @write_channel
-      @write_channel.flush(timeout)
-    end
-
-    # @return [Boolean] Whether the stream is connected
-    def connected?
-      return false unless super()
-      return true unless @read_channel or @write_channel
-      channels.each { |channel| return false if channel.stopped? }
-      true
-    end
-
-    # Stop the channels then let the stock implementation close the ports
-    def disconnect
-      release_channels(@flush_timeout)
-      super()
     end
 
     protected
 
-    # @return [Array<Cosmos::BufferedIO::StreamChannel>] Unique live channels
-    def channels
-      [@read_channel, @write_channel].compact.uniq { |channel| channel.object_id }
+    # (see BufferedIO::Transport#buffered_readable?)
+    def buffered_readable?
+      !!@read_serial_port
     end
 
-    # Hand the configured descriptors to the C++ channels. Any failure at all
-    # falls back to the stock Ruby driver - a buffering problem must never be
-    # able to break a port that plain Ruby can serve.
-    def adopt_buffered_channels
-      return unless BufferedIO.available?
-      return if @read_channel or @write_channel
-
-      begin
-        read_handle = serial_handle(@read_serial_port)
-        write_handle = serial_handle(@write_serial_port)
-        if read_handle
-          @read_channel = BufferedIO::StreamChannel.adopt(read_handle.fileno, @ring_bytes)
-          @read_channel.overflow_policy = @overflow_policy if @overflow_policy
-        end
-        if write_handle
-          if read_handle and @write_serial_port.equal?(@read_serial_port) and @read_channel
-            # One port opened once: one channel, one reader, one writer.
-            @write_channel = @read_channel
-          else
-            @write_channel = BufferedIO::StreamChannel.adopt(write_handle.fileno,
-                                                             WRITE_ONLY_RING_BYTES)
-            # Nothing ever reads this ring, so back pressure would eventually
-            # wedge the reader against a full ring and leave bytes piling up in
-            # the tty. Drop them instead - they were never going anywhere.
-            @write_channel.overflow_policy = :drop_oldest
-          end
-        end
-        channels.each do |channel|
-          channel.write_policy = @write_policy if @write_policy
-          channel.write_high_water = @write_high_water if @write_high_water
-        end
-      rescue Exception => error
-        # Never let the buffered path break a port Ruby can serve
-        BufferedIO.log_fallback(self.class.name)
-        Logger.warn("#{self.class.name}: #{error.class}: #{error.message}") if defined?(Logger)
-        release_channels(0)
-      end
+    # (see BufferedIO::Transport#buffered_writable?)
+    def buffered_writable?
+      !!@write_serial_port
     end
 
-    # @param flush_timeout [Float] Seconds to let queued writes drain
-    def release_channels(flush_timeout)
-      channels.each do |channel|
-        begin
-          channel.disconnect(flush_timeout)
-        rescue Exception
-          # Nothing useful to do if the channel is already gone
+    # PosixSerialDriver#read_nonblock hands back everything the driver has, so
+    # a nonblocking read of the ring returns the whole backlog too.
+    def buffered_nonblock_read_bytes
+      @read_chunk_bytes
+    end
+
+    # The write mutex is kept so commands from more than one tool interleave
+    # exactly as they do today.
+    def buffered_write_lock(&block)
+      @write_mutex.synchronize(&block)
+    end
+
+    # Adopt the configured descriptors. Called inside the
+    # fallback-on-any-failure wrapper in
+    # {BufferedIO::Transport#adopt_buffered_channels}.
+    def adopt_channels
+      read_handle = serial_handle(@read_serial_port)
+      write_handle = serial_handle(@write_serial_port)
+      if read_handle
+        @read_channel = BufferedIO::StreamChannel.adopt(read_handle.fileno, @ring_bytes)
+        @read_channel.overflow_policy = @overflow_policy if @overflow_policy
+      end
+      if write_handle
+        if read_handle and @write_serial_port.equal?(@read_serial_port) and @read_channel
+          # One port opened once: one channel, one reader, one writer.
+          @write_channel = @read_channel
+        else
+          @write_channel = BufferedIO::StreamChannel.adopt(write_handle.fileno,
+                                                           WRITE_ONLY_RING_BYTES)
+          # Nothing ever reads this ring, so back pressure would eventually
+          # wedge the reader against a full ring and leave bytes piling up in
+          # the tty. Drop them instead - they were never going anywhere.
+          @write_channel.overflow_policy = :drop_oldest
         end
       end
-      @read_channel = nil
-      @write_channel = nil
     end
 
     # @return [IO|nil] The open tty behind a {SerialDriver}, or nil when there

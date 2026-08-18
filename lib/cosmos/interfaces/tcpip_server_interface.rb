@@ -55,6 +55,8 @@ module Cosmos
   # COSMOS_NO_BUFFERED_IO=1, and it is skipped automatically wherever the
   # extension is not built.
   class TcpipServerInterface < StreamInterface
+    include BufferedIO::InterfaceOptions
+
     # Data class which stores the interface and associated information
     class InterfaceInfo
       attr_reader :interface, :hostname, :host_ip, :port
@@ -133,10 +135,10 @@ module Cosmos
       @connection_mutex = Mutex.new
       @listen_address = "0.0.0.0"
       @auto_system_meta = false
-      # nil means "use the buffered backend if it is available" (the default).
-      # OPTION BUFFERED FALSE or COSMOS_NO_BUFFERED_IO force the stock stream.
-      @buffered = nil
-      @buffered_options = {}
+      # BUFFERED, BUFFERED_RING_BYTES and BUFFERED_OVERFLOW; each client
+      # stream's own defaults (16 MiB ring, :backpressure) apply until one is
+      # given.
+      initialize_buffered_options()
 
       @read_allowed = false unless ConfigParser.handle_nil(read_port)
       @write_allowed = false unless ConfigParser.handle_nil(write_port)
@@ -303,13 +305,6 @@ module Cosmos
       change_raw_logging(:stop)
     end
 
-    # @return [Boolean] Whether newly accepted clients read through the
-    #   buffered C++ backend
-    def buffered?
-      return false if @buffered == false
-      BufferedIO.available?
-    end
-
     # Buffered channel counters summed over every currently connected client.
     # A server has no single stream of its own, so the per client streams are
     # aggregated: :drop_count and :stall_count answer "is any client backing
@@ -348,10 +343,10 @@ module Cosmos
     # Supported Options
     # LISTEN_ADDRESS - Ip address of the interface to accept connections on - Default: 0.0.0.0
     # AUTO_SYSTEM_META - Automatically send SYSTEM META on connect - Default false
-    # BUFFERED - FALSE disables the buffered C++ backend for this interface
-    # BUFFERED_RING_BYTES - Size of each client's C++ read ring (default 16 MiB)
-    # BUFFERED_OVERFLOW - backpressure (default), drop_oldest or drop_newest.
-    #   TCP is lossless today and stays lossless by default; see
+    # BUFFERED, BUFFERED_RING_BYTES (each client's read ring) and
+    #   BUFFERED_OVERFLOW are parsed by
+    #   {BufferedIO::InterfaceOptions#set_option}, reached through the super
+    #   below. TCP is lossless today and stays lossless by default; see
     #   doc/buffered_io_design.md.
     # (see Interface#set_option)
     def set_option(option_name, option_values)
@@ -361,12 +356,6 @@ module Cosmos
         @listen_address = option_values[0]
       when 'AUTO_SYSTEM_META'
         @auto_system_meta = ConfigParser.handle_true_false(option_values[0])
-      when 'BUFFERED'
-        @buffered = ConfigParser.handle_true_false(option_values[0].to_s)
-      when 'BUFFERED_RING_BYTES'
-        @buffered_options[:ring_bytes] = Integer(option_values[0])
-      when 'BUFFERED_OVERFLOW'
-        @buffered_options[:overflow_policy] = option_values[0].to_s.downcase.to_sym
       end
     end
 
@@ -387,9 +376,7 @@ module Cosmos
                                       @read_timeout,
                                       @buffered_options.merge(:adopt_write_only => false))
       else
-        # Automatic, logged once: the extension is not available on this
-        # platform so the original pure Ruby stream is used unchanged.
-        BufferedIO.log_fallback(@name) if @buffered.nil? and !BufferedIO.extension_loaded?
+        log_buffered_fallback()
         TcpipSocketStream.new(write_socket, read_socket, @write_timeout, @read_timeout)
       end
     end

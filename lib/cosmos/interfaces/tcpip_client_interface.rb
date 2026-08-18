@@ -14,7 +14,13 @@ require 'cosmos/streams/buffered_tcpip_client_stream'
 
 module Cosmos
   # Base class for interfaces that act as a TCP/IP client
+  #
+  # Options: BUFFERED, BUFFERED_RING_BYTES and BUFFERED_OVERFLOW, all parsed by
+  # {BufferedIO::InterfaceOptions#set_option}. TCP is lossless today and stays
+  # lossless by default; see doc/buffered_io_design.md for why a byte stream
+  # defaults to back pressure while UDP defaults to dropping.
   class TcpipClientInterface < StreamInterface
+    include BufferedIO::InterfaceOptions
 
     # @param hostname [String] Machine to connect to
     # @param write_port [Integer] Port to write commands to
@@ -43,10 +49,9 @@ module Cosmos
       @read_allowed = false unless @read_port
       @write_allowed = false unless @write_port
       @write_raw_allowed = false unless @write_port
-      # nil means "use the buffered backend if it is available" (the default).
-      # OPTION BUFFERED FALSE or COSMOS_NO_BUFFERED_IO force the stock stream.
-      @buffered = nil
-      @buffered_options = {}
+      # BUFFERED, BUFFERED_RING_BYTES and BUFFERED_OVERFLOW; the stream's own
+      # defaults (16 MiB ring, :backpressure) apply until one is given.
+      initialize_buffered_options()
     end
 
     # Connects the stream by passing the initialization parameters to
@@ -54,36 +59,6 @@ module Cosmos
     def connect
       @stream = build_stream()
       super()
-    end
-
-    # @return [Boolean] Whether this interface reads and writes through the
-    #   buffered C++ backend
-    def buffered?
-      return false if @buffered == false
-      BufferedIO.available?
-    end
-
-    # Supported Options
-    # BUFFERED - FALSE disables the buffered C++ backend for this interface
-    # BUFFERED_RING_BYTES - Size of the C++ read ring (default 16 MiB)
-    # BUFFERED_OVERFLOW - backpressure (default), drop_oldest or drop_newest.
-    #   TCP is lossless today and stays lossless by default; see
-    #   doc/buffered_io_design.md for why a byte stream defaults to back
-    #   pressure while UDP defaults to dropping.
-    # (see Interface#set_option)
-    #
-    # @param option_name (see Interface#set_option)
-    # @param option_values (see Interface#set_option)
-    def set_option(option_name, option_values)
-      super(option_name, option_values)
-      case option_name.to_s.upcase
-      when 'BUFFERED'
-        @buffered = ConfigParser.handle_true_false(option_values[0].to_s)
-      when 'BUFFERED_RING_BYTES'
-        @buffered_options[:ring_bytes] = Integer(option_values[0])
-      when 'BUFFERED_OVERFLOW'
-        @buffered_options[:overflow_policy] = option_values[0].to_s.downcase.to_sym
-      end
     end
 
     protected
@@ -100,9 +75,7 @@ module Cosmos
           @buffered_options
         )
       else
-        # Automatic, logged once: the extension is not available on this
-        # platform so the original pure Ruby stream is used unchanged.
-        BufferedIO.log_fallback(@name) if @buffered.nil? and !BufferedIO.extension_loaded?
+        log_buffered_fallback()
         TcpipClientStream.new(
           @hostname,
           @write_port,
