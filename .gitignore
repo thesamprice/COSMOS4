@@ -54,3 +54,4 @@ vendor/bundle/
 python/venv/
 __pycache__/
 *.pyc
+*.dSYM/
