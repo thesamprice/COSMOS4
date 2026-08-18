@@ -87,7 +87,17 @@ public:
 
   // Signal stop, unblock the syscalls with shutdown(2) and join. If
   // flush_timeout_s is > 0 the outgoing queue is given that long to drain
-  // before the fd is shut down. Safe to call more than once.
+  // before the fd is shut down.
+  //
+  // Safe to call more than once AND from more than one thread at a time. The
+  // concurrency matters: InterfaceThread#stop disconnects the interface from
+  // the server thread while the interface's own thread can be inside
+  // handle_connection_lost -> disconnect, so two Ruby threads really do land
+  // in here together. std::thread::join is not reentrant - the second joiner
+  // gets ESRCH and throws std::system_error, which is a C++ exception crossing
+  // rb_thread_call_without_gvl and therefore std::terminate, not something
+  // Ruby's `rescue Exception` can catch. stop_mutex_ serializes the whole
+  // teardown so the second caller finds the threads already reaped.
   void stop(double flush_timeout_s);
 
   // True until stop() is called and while no error/EOF has been latched.
@@ -190,6 +200,14 @@ protected:
 
   std::thread reader_thread_;
   std::thread writer_thread_;
+  // Serializes stop(). Never held while any other lock is taken.
+  std::mutex stop_mutex_;
+
+private:
+  // join() both threads exactly once, swallowing the std::system_error a
+  // pathological platform could still raise. Nothing may throw out of stop():
+  // it runs with the GVL released and a C++ exception there aborts the VM.
+  void join_threads();
 };
 
 } // namespace cosmos

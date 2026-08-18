@@ -156,16 +156,12 @@ module Cosmos
     # @return [Hash] Buffered channel statistics. Unlike the kernel's silent
     #   SO_RCVBUF overflow, everything lost here is counted.
     def buffered_stats
-      stats = {
-        :buffered => false,
-        :bytes_read => 0,
-        :bytes_written => 0,
-        :drop_count => 0,
-        :buffered_datagrams => 0,
-        :buffered_bytes => 0,
-        :high_water => 0,
-        :pending_write_bytes => 0
-      }
+      # The common shape (see BufferedIO.empty_stats) plus the datagram
+      # specific counter. :stall_count stays zero: a datagram channel refuses
+      # :backpressure on purpose, so it never stalls - :drop_count is the
+      # counter that matters here, and unlike the kernel's it is visible.
+      stats = BufferedIO.empty_stats
+      stats[:buffered_datagrams] = 0
       return stats unless @read_channel or @write_channel
       stats[:buffered] = true
       if @read_channel
@@ -174,6 +170,7 @@ module Cosmos
         stats[:buffered_datagrams] = @read_channel.buffered_datagrams
         stats[:buffered_bytes] = @read_channel.buffered_bytes
         stats[:high_water] = @read_channel.high_water
+        stats[:ring_bytes] = @read_channel.ring_bytes
       end
       if @write_channel
         stats[:bytes_written] = @write_channel.bytes_written

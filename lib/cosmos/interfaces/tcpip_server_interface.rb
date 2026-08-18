@@ -12,7 +12,9 @@ require 'socket'
 require 'thread' # For Mutex
 require 'timeout' # For Timeout::Error
 require 'cosmos/interfaces/stream_interface'
+require 'cosmos/io/buffered_io'
 require 'cosmos/streams/tcpip_socket_stream'
+require 'cosmos/streams/buffered_tcpip_socket_stream'
 require 'cosmos/config/config_parser'
 
 module Cosmos
@@ -24,6 +26,34 @@ module Cosmos
   # available by calling the TcpipServer read method. For each connection to the
   # write port, a thread is spawned that calls the write method from the
   # interface when data is send to the TcpipServer via the write method.
+  #
+  # == Buffered I/O
+  #
+  # The Ruby accept loop is unchanged. What changes by default is the stream
+  # each accepted client gets: a {BufferedTcpipSocketStream}, so a C++ reader
+  # thread drains that client's socket the moment data lands instead of waiting
+  # for the per client Ruby read thread to win the GVL. Every client has its
+  # own channel, so one client's teardown never touches another's.
+  #
+  # Two deliberate limits on where the buffering is applied:
+  #
+  # * A *write only* client socket (the separate write port configuration) is
+  #   never adopted. {#check_for_dead_clients} detects a departed write client
+  #   by calling recvfrom_nonblock on that socket in Ruby; a C++ reader thread
+  #   on the same descriptor would consume the EOF first and the client would
+  #   never be reaped. The stream is therefore built with
+  #   <tt>:adopt_write_only => false</tt> and those sockets keep the stock Ruby
+  #   write path - which costs nothing, because the server already decouples
+  #   the producer from the socket with its own write queue and write thread.
+  # * When the read and write ports are the same (one socket per client, the
+  #   common case) the single channel serves both directions, exactly as the
+  #   TCP client stream does. check_for_dead_clients explicitly leaves that
+  #   case to the read thread, which the buffered read path detects the same
+  #   way the stock one does (EOF then an empty read).
+  #
+  # Turning it off per interface is OPTION BUFFERED FALSE; globally it is
+  # COSMOS_NO_BUFFERED_IO=1, and it is skipped automatically wherever the
+  # extension is not built.
   class TcpipServerInterface < StreamInterface
     # Data class which stores the interface and associated information
     class InterfaceInfo
@@ -103,6 +133,10 @@ module Cosmos
       @connection_mutex = Mutex.new
       @listen_address = "0.0.0.0"
       @auto_system_meta = false
+      # nil means "use the buffered backend if it is available" (the default).
+      # OPTION BUFFERED FALSE or COSMOS_NO_BUFFERED_IO force the stock stream.
+      @buffered = nil
+      @buffered_options = {}
 
       @read_allowed = false unless ConfigParser.handle_nil(read_port)
       @write_allowed = false unless ConfigParser.handle_nil(write_port)
@@ -269,9 +303,56 @@ module Cosmos
       change_raw_logging(:stop)
     end
 
+    # @return [Boolean] Whether newly accepted clients read through the
+    #   buffered C++ backend
+    def buffered?
+      return false if @buffered == false
+      BufferedIO.available?
+    end
+
+    # Buffered channel counters summed over every currently connected client.
+    # A server has no single stream of its own, so the per client streams are
+    # aggregated: :drop_count and :stall_count answer "is any client backing
+    # up" without the operator having to enumerate clients. :clients is how
+    # many of them are actually buffered.
+    #
+    # @return [Hash] see {BufferedIO.empty_stats}, plus :clients
+    def buffered_stats
+      stats = BufferedIO.empty_stats
+      stats[:clients] = 0
+      @connection_mutex.synchronize do
+        interfaces = []
+        @write_interface_infos.each { |info| interfaces << info.interface }
+        @read_interface_infos.each { |info| interfaces << info.interface }
+        interfaces.uniq.each do |interface|
+          next unless interface.respond_to?(:buffered_stats)
+          client = interface.buffered_stats
+          next unless client[:buffered]
+          stats[:buffered] = true
+          stats[:clients] += 1
+          # high_water and ring_bytes are per client sizes, so the interesting
+          # server wide number is the worst client, not the sum.
+          [:bytes_read, :bytes_written, :drop_count, :stall_count,
+           :buffered_bytes, :pending_write_bytes].each do |key|
+            stats[key] += client[key].to_i
+          end
+          [:high_water, :ring_bytes].each do |key|
+            value = client[key].to_i
+            stats[key] = value if value > stats[key]
+          end
+        end
+      end
+      stats
+    end
+
     # Supported Options
     # LISTEN_ADDRESS - Ip address of the interface to accept connections on - Default: 0.0.0.0
     # AUTO_SYSTEM_META - Automatically send SYSTEM META on connect - Default false
+    # BUFFERED - FALSE disables the buffered C++ backend for this interface
+    # BUFFERED_RING_BYTES - Size of each client's C++ read ring (default 16 MiB)
+    # BUFFERED_OVERFLOW - backpressure (default), drop_oldest or drop_newest.
+    #   TCP is lossless today and stays lossless by default; see
+    #   doc/buffered_io_design.md.
     # (see Interface#set_option)
     def set_option(option_name, option_values)
       super(option_name, option_values)
@@ -280,10 +361,38 @@ module Cosmos
         @listen_address = option_values[0]
       when 'AUTO_SYSTEM_META'
         @auto_system_meta = ConfigParser.handle_true_false(option_values[0])
+      when 'BUFFERED'
+        @buffered = ConfigParser.handle_true_false(option_values[0].to_s)
+      when 'BUFFERED_RING_BYTES'
+        @buffered_options[:ring_bytes] = Integer(option_values[0])
+      when 'BUFFERED_OVERFLOW'
+        @buffered_options[:overflow_policy] = option_values[0].to_s.downcase.to_sym
       end
     end
 
     protected
+
+    # The stream for one accepted client. Buffered by default; the stock
+    # {TcpipSocketStream} when the extension is unavailable, when
+    # COSMOS_NO_BUFFERED_IO is set or when OPTION BUFFERED FALSE was given.
+    #
+    # A stream that cannot adopt its socket (a test double, a socket that went
+    # away between accept and here) falls back on its own inside
+    # {BufferedSocketStream#adopt_buffered_channels}, so this never has to
+    # decide whether a descriptor is adoptable.
+    def build_client_stream(write_socket, read_socket)
+      if buffered?
+        # :adopt_write_only is false on purpose - see the class comment.
+        BufferedTcpipSocketStream.new(write_socket, read_socket, @write_timeout,
+                                      @read_timeout,
+                                      @buffered_options.merge(:adopt_write_only => false))
+      else
+        # Automatic, logged once: the extension is not available on this
+        # platform so the original pure Ruby stream is used unchanged.
+        BufferedIO.log_fallback(@name) if @buffered.nil? and !BufferedIO.extension_loaded?
+        TcpipSocketStream.new(write_socket, read_socket, @write_timeout, @read_timeout)
+      end
+    end
 
     def shutdown_interfaces(interface_infos)
       @connection_mutex.synchronize do
@@ -385,7 +494,7 @@ module Cosmos
       read_socket = nil
       write_socket = socket if listen_write
       read_socket = socket if listen_read
-      stream = TcpipSocketStream.new(write_socket, read_socket, @write_timeout, @read_timeout)
+      stream = build_client_stream(write_socket, read_socket)
 
       interface = StreamInterface.new
       interface.target_names = @target_names

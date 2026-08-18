@@ -99,17 +99,7 @@ module Cosmos
     #   ever dropped by us, so a rising stall count is the early warning that
     #   Ruby is not draining and the tty input buffer is next in line.
     def buffered_stats
-      stats = {
-        :buffered => false,
-        :bytes_read => 0,
-        :bytes_written => 0,
-        :drop_count => 0,
-        :buffered_bytes => 0,
-        :high_water => 0,
-        :stall_count => 0,
-        :ring_bytes => 0,
-        :pending_write_bytes => 0
-      }
+      stats = BufferedIO.empty_stats
       return stats unless @read_channel or @write_channel
       stats[:buffered] = true
       if @read_channel

@@ -187,7 +187,24 @@ void BufferedChannel::writer_loop() {
   }
 }
 
+void BufferedChannel::join_threads() {
+  try {
+    if (reader_thread_.joinable()) reader_thread_.join();
+  } catch (...) {
+    // Already reaped by someone else. Nothing may throw out of stop().
+  }
+  try {
+    if (writer_thread_.joinable()) writer_thread_.join();
+  } catch (...) {
+  }
+}
+
 void BufferedChannel::stop(double flush_timeout_s) {
+  // Serialized: two Ruby threads disconnecting the same interface at the same
+  // time is normal (see the header). Whoever arrives second waits here and
+  // then finds the threads already joined.
+  std::lock_guard<std::mutex> stop_lock(stop_mutex_);
+
   if (!started_.load()) {
     stop_.store(true);
     close_fd();
@@ -195,8 +212,7 @@ void BufferedChannel::stop(double flush_timeout_s) {
   }
   if (stop_.load()) {
     // Already stopping/stopped - just make sure the threads are reaped.
-    if (reader_thread_.joinable()) reader_thread_.join();
-    if (writer_thread_.joinable()) writer_thread_.join();
+    join_threads();
     close_fd();
     release_buffers();
     return;
@@ -217,8 +233,7 @@ void BufferedChannel::stop(double flush_timeout_s) {
   // Unblock any thread parked in a syscall on the fd.
   shutdown_fd();
 
-  if (reader_thread_.joinable()) reader_thread_.join();
-  if (writer_thread_.joinable()) writer_thread_.join();
+  join_threads();
   close_fd();
   release_buffers();
 }

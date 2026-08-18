@@ -9,6 +9,7 @@
 # attribution addendums as found in the LICENSE.txt
 
 require 'cosmos/tools/cmd_tlm_server/connections'
+require 'cosmos/io/buffered_io'
 
 module Cosmos
 
@@ -114,10 +115,16 @@ module Cosmos
 
     # Get info about an interface by name
     #
+    # The first eight elements are exactly what they have always been. A ninth
+    # element was appended for the buffered C++ backends: a Hash of that
+    # interface's buffered counters (see {#buffered_info}). Appending keeps
+    # every existing caller working - the response is a superset of the old
+    # one - and a Hash means future counters need no further API change.
+    #
     # @return [Array<String, Numeric, Numeric, Numeric, Numeric, Numeric,
-    #   Numeric, Numeric>] Array containing \[state, num_clients,
+    #   Numeric, Numeric, Hash>] Array containing \[state, num_clients,
     #   write_queue_size, read_queue_size, bytes_written, bytes_read,
-    #   write_count, read_count] for the interface
+    #   write_count, read_count, buffered_info] for the interface
     def get_info(interface_name)
       interface = @config.interfaces[interface_name.upcase]
       raise "Unknown interface: #{interface_name}" unless interface
@@ -125,7 +132,39 @@ module Cosmos
       return [state(interface_name),      interface.num_clients,
               interface.write_queue_size, interface.read_queue_size,
               interface.bytes_written,    interface.bytes_read,
-              interface.write_count,      interface.read_count]
+              interface.write_count,      interface.read_count,
+              buffered_info(interface)]
+    end
+
+    # Buffered C++ backend counters for an interface, with String keys so the
+    # shape is the same whether the caller went through JSON-RPC or called the
+    # API directly.
+    #
+    # 'drop_count' is data the ring threw away - always zero for the byte
+    # streams under their default :backpressure policy, and for UDP the loss
+    # that used to happen invisibly inside SO_RCVBUF. 'stall_count' is the
+    # earlier warning: the reader had to stop reading the device because Ruby
+    # was not draining the ring.
+    #
+    # An interface with no buffered backend (stock stream, extension not
+    # built, OPTION BUFFERED FALSE, a router) reports 'buffered' => false and
+    # zeros rather than nothing at all, so a display never has to special case
+    # it.
+    #
+    # @param interface [Interface] The interface to interrogate
+    # @return [Hash<String, Object>]
+    def buffered_info(interface)
+      stats = if interface.respond_to?(:buffered_stats)
+                interface.buffered_stats
+              else
+                BufferedIO.empty_stats
+              end
+      info = {}
+      stats.each { |key, value| info[key.to_s] = value }
+      info
+    rescue Exception
+      # Statistics must never be able to break the status display
+      {}
     end
 
     protected

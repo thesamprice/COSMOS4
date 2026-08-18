@@ -79,5 +79,39 @@ module Cosmos
     def self.reset_fallback_log
       @fallback_logged = false
     end
+
+    # The canonical zeroed statistics hash. Every buffered stream and interface
+    # returns this shape (a transport may add keys of its own - UDP adds
+    # :buffered_datagrams) so the CmdTlmServer can read the same counters off
+    # any interface without knowing which transport is underneath, and so a
+    # stock, unbuffered interface answers with zeros rather than nil.
+    #
+    #   :buffered            - whether a C++ channel is actually in use
+    #   :drop_count          - bytes (datagrams for UDP) the ring threw away.
+    #                          Always zero under the default :backpressure
+    #                          policy for the byte streams.
+    #   :stall_count         - times the reader stopped reading the device
+    #                          because the ring was full. The early warning
+    #                          that Ruby is not draining; always zero for UDP,
+    #                          which cannot back pressure.
+    #   :buffered_bytes      - backlog sitting in the ring right now
+    #   :high_water          - largest backlog ever held
+    #   :ring_bytes          - configured ring size
+    #   :pending_write_bytes - queued for the writer thread
+    #
+    # @return [Hash] A fresh hash - callers mutate it
+    def self.empty_stats
+      {
+        :buffered => false,
+        :bytes_read => 0,
+        :bytes_written => 0,
+        :drop_count => 0,
+        :stall_count => 0,
+        :buffered_bytes => 0,
+        :high_water => 0,
+        :ring_bytes => 0,
+        :pending_write_bytes => 0
+      }
+    end
   end
 end

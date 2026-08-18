@@ -1471,6 +1471,7 @@ spec/install/config/tools/cmd_tlm_server/cmd_tlm_server.txt
 spec/install/lib/README.txt
 spec/install/yaml_docs_spec.rb
 spec/interfaces/buffered_serial_interface_spec.rb
+spec/interfaces/buffered_tcpip_server_interface_spec.rb
 spec/interfaces/buffered_udp_interface_spec.rb
 spec/interfaces/cmd_tlm_server_interface_spec.rb
 spec/interfaces/interface_spec.rb
@@ -1490,6 +1491,7 @@ spec/interfaces/tcpip_client_interface_spec.rb
 spec/interfaces/tcpip_server_interface_spec.rb
 spec/interfaces/udp_interface_spec.rb
 spec/io/buffered_file_spec.rb
+spec/io/buffered_io_spec.rb
 spec/io/io_multiplexer_spec.rb
 spec/io/json_drb_object_spec.rb
 spec/io/json_drb_rack_spec.rb

@@ -44,9 +44,15 @@ module Cosmos
     #
     # @param options [Hash] :ring_bytes, :write_high_water, :write_policy
     #   (:block or :raise), :overflow_policy (:backpressure, :drop_oldest or
-    #   :drop_newest), :flush_timeout
+    #   :drop_newest), :flush_timeout, :adopt_write_only
     def setup_buffered_options(options = {})
       options ||= {}
+      # Whether a socket that is only ever written (a separate write port) gets
+      # a channel of its own. True everywhere except the TCP server, which
+      # detects a departed write-only client by reading that socket in Ruby -
+      # a C++ reader thread on the same descriptor would eat the EOF and the
+      # client would never be reaped. See TcpipServerInterface.
+      @adopt_write_only = options.key?(:adopt_write_only) ? !!options[:adopt_write_only] : true
       @ring_bytes = (options[:ring_bytes] || DEFAULT_RING_BYTES).to_i
       # Bytes returned by one read. A read only ever returns what is actually
       # buffered, so a large cap costs nothing when the stream is keeping up
@@ -77,24 +83,27 @@ module Cosmos
       @last_read_time_f
     end
 
+    # @return [Boolean] Whether this stream is actually running through the
+    #   buffered C++ backend
+    def buffered?
+      !!(@read_channel or @write_channel)
+    end
+
     # @return [Hash] Buffered channel statistics for the CmdTlmServer counters
+    #   (see BufferedIO.empty_stats). :drop_count stays zero under the default
+    #   :backpressure policy - TCP is lossless and must stay lossless - so
+    #   :stall_count is the counter that says Ruby is falling behind.
     def buffered_stats
-      stats = {
-        :buffered => false,
-        :bytes_read => 0,
-        :bytes_written => 0,
-        :drop_count => 0,
-        :buffered_bytes => 0,
-        :high_water => 0,
-        :pending_write_bytes => 0
-      }
+      stats = BufferedIO.empty_stats
       return stats unless @read_channel or @write_channel
       stats[:buffered] = true
       if @read_channel
         stats[:bytes_read] = @read_channel.bytes_read
         stats[:drop_count] = @read_channel.drop_count
+        stats[:stall_count] = @read_channel.stall_count
         stats[:buffered_bytes] = @read_channel.buffered_bytes
         stats[:high_water] = @read_channel.high_water
+        stats[:ring_bytes] = @read_channel.ring_bytes
       end
       if @write_channel
         stats[:bytes_written] = @write_channel.bytes_written
@@ -211,7 +220,7 @@ module Cosmos
         if @write_socket and adoptable?(@write_socket)
           if @read_socket and @write_socket.equal?(@read_socket) and @read_channel
             @write_channel = @read_channel
-          else
+          elsif @adopt_write_only
             # A write only socket never delivers telemetry, so it does not need
             # a telemetry sized ring.
             @write_channel = BufferedIO::StreamChannel.adopt(@write_socket.fileno,

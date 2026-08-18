@@ -1187,11 +1187,20 @@ module Cosmos
 
     # Get information about an interface
     #
+    # The trailing Hash is the buffered C++ backend's counters and was
+    # appended to the original eight element response; existing callers that
+    # index the first eight elements are unaffected. Its keys are Strings:
+    # 'buffered', 'bytes_read', 'bytes_written', 'drop_count', 'stall_count',
+    # 'buffered_bytes', 'high_water', 'ring_bytes', 'pending_write_bytes'
+    # (plus 'buffered_datagrams' for UDP and 'clients' for a TCP server). An
+    # interface running the stock pure Ruby path reports 'buffered' => false
+    # and zeros. See doc/buffered_io_design.md.
+    #
     # @param interface_name [String] Interface name
     # @return [Array<String, Numeric, Numeric, Numeric, Numeric, Numeric,
-    #   Numeric, Numeric>] Array containing \[state, num clients,
+    #   Numeric, Numeric, Hash>] Array containing \[state, num clients,
     #   TX queue size, RX queue size, TX bytes, RX bytes, Command count,
-    #   Telemetry count] for the interface
+    #   Telemetry count, buffered stats] for the interface
     def get_interface_info(interface_name)
       CmdTlmServer.interfaces.get_info(interface_name)
     end
@@ -1199,9 +1208,10 @@ module Cosmos
     # Get information about all interfaces
     #
     # @return [Array<Array<String, Numeric, Numeric, Numeric, Numeric, Numeric,
-    #   Numeric, Numeric>>] Array of Arrays containing \[name, state, num clients,
+    #   Numeric, Numeric, Hash>>] Array of Arrays containing \[name, state, num clients,
     #   TX queue size, RX queue size, TX bytes, RX bytes, Command count,
-    #   Telemetry count] for all interfaces
+    #   Telemetry count, buffered stats] for all interfaces
+    #   (see {#get_interface_info})
     def get_all_interface_info
       info = []
       CmdTlmServer.interfaces.names.sort.each do |interface_name|

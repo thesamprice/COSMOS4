@@ -1,5 +1,49 @@
 # Buffered C++ I/O backends (design)
 
+> **Status: complete.** Milestones 1-5 are implemented and shipped:
+> core + TCP client, UDP, serial, TCP server, and the opt-out plumbing,
+> counters and documentation.
+
+## Summary for operators
+
+COSMOS interfaces now drain their devices from C++ threads that never take the
+Ruby GVL. **This is on by default** for every TCP, UDP and serial interface, and
+existing configuration files get it with no changes.
+
+**What it fixes.** While any Ruby thread is busy (decom, logging, GUI painting,
+a running script) the interface thread is not scheduled. UDP datagrams then
+overflow `SO_RCVBUF` and serial bytes overrun the tty buffer — silently and
+uncounted. TCP loses nothing but back-pressures the spacecraft and stamps
+telemetry with the time Ruby finally woke up rather than the time the data
+arrived.
+
+**What you see.** `test/benchmarks/buffered_io_bench.rb`, with a Ruby thread
+deliberately hogging the GVL (macOS arm64, Ruby 4.0.6):
+
+| Scenario | Stock | Buffered |
+| --- | --- | --- |
+| UDP, 50k datagrams at 25k/s | **46473 lost — 92.9% of the stream, silently** | 10 lost (0.02%) |
+| Serial (pty, 20k records at 10k/s) | 9 records/s drained | 9722 records/s drained |
+| TCP client, sustained 32 MiB | receive time off by 300 ms mean / 1.25 s max | 4 ms mean / 147 ms max |
+| TCP server, 4 clients | 653 KB piled up in the kernel receive queues; 2282 records/s | 3 KB; 14371 records/s |
+
+Nothing that used to work behaves differently: same data, same protocols, same
+counters, same exceptions, same config file syntax.
+
+**What is new to look at.** Interfaces publish `drop_count` (data the ring
+discarded — always zero for TCP and serial under their defaults) and
+`stall_count` (times the reader had to stop because Ruby was not draining — the
+*early warning*, before anything is lost). Both ride along with the existing
+interface status. Loss that used to be invisible is now counted.
+
+**How to turn it off.** `OPTION BUFFERED FALSE` on one interface, or
+`COSMOS_NO_BUFFERED_IO=1` for the whole process. It is also skipped
+automatically wherever the extension is not built. In every case the original
+pure-Ruby code runs unchanged.
+
+Full configuration reference:
+[buffered_io_configuration.md](buffered_io_configuration.md).
+
 ## Problem
 
 Every interface reads its device from a **Ruby** thread. Ruby threads
@@ -247,17 +291,140 @@ really does prefer freshness over framing.
   applies every flag; the channel only adopts the configured
   descriptor. Nothing in the extension knows what a baud rate is.
 
+## Milestone 4 (TCP server): decisions and deviations
+
+The Ruby accept loop is byte for byte the stock one. The only change at the
+accept site is which stream class the accepted socket is wrapped in, and even
+that is a one line `build_client_stream` hook so the fallback and the option
+handling live in one place.
+
+### A write-only client socket is deliberately **not** adopted
+
+This is the one place where buffering a socket would break the server.
+
+`check_for_dead_clients` detects a client that has gone away from the *write*
+port by calling `recvfrom_nonblock` on that socket from Ruby: a success (or a
+reset) means the client is gone, `EWOULDBLOCK` means it is still there. A C++
+reader thread on the same descriptor consumes the EOF first, so Ruby would see
+`EWOULDBLOCK` forever and the client would never be reaped — a leak of one
+interface, one stream and one channel per departed client, growing without
+bound on a server whose clients reconnect.
+
+So `BufferedSocketStream` grew one option, `:adopt_write_only` (default true,
+so nothing about milestones 1-3 changes), and the server passes false. The
+write-only sockets in a separate-ports configuration therefore keep the stock
+Ruby write path.
+
+Nothing is given up by that. The buffered writer exists to stop a slow peer
+stalling a GVL-holding thread, and a TCP server **already** solves that
+problem: `Interface#write` only pushes onto the server's own `@write_queue`,
+and a dedicated write thread does the socket calls. Adding a second queue
+underneath the first would be pure double-buffering — more memory, one more
+place for data to sit, and a client's death detected later.
+
+When the read and write ports are the *same* (one socket per client, the usual
+configuration) the single channel serves both directions, exactly as the TCP
+client stream does. That is safe because `check_for_dead_clients` explicitly
+skips the recvfrom probe in that case and leaves the detection to the read
+thread, which the buffered read path performs identically to the stock one:
+buffered bytes first, then `EOFError`.
+
+### The write path composes without surprises
+
+With a shared socket, `write_to_clients` calls `interface.write` → the channel's
+queue. Two consequences, both benign:
+
+- A dead client is detected one packet later than stock. `write` returns as
+  soon as the data is queued, so the `EPIPE`/`ECONNRESET` is latched by the
+  writer thread and raised by the *next* `write`, where `write_to_clients`
+  rescues it and drops the client exactly as it does today.
+- A slow client is tolerated longer before it is dropped. Stock raises
+  `Timeout::Error` after `write_timeout` in the socket call; buffered raises it
+  only once the queue is above its high water mark and stays there for
+  `write_timeout`. Below the high water mark the enqueue is instant, so a slow
+  client can no longer make the server's single write thread wait on it — which
+  is the whole point.
+
+### `stop()` had to become thread safe
+
+Found by running `spec/tools` against the buffered backend for the first time.
+`InterfaceThread#stop` disconnects the interface from the server's thread while
+the interface's own thread can be inside `handle_connection_lost` → `disconnect`,
+so two Ruby threads land in `BufferedChannel::stop()` together. `std::thread::join`
+is not reentrant: the second joiner gets `ESRCH` and throws `std::system_error`,
+which is a C++ exception crossing `rb_thread_call_without_gvl` and therefore
+`std::terminate` — not something Ruby's `rescue Exception` can catch. The VM
+aborted with SIGABRT.
+
+`stop()` now takes a dedicated `stop_mutex_` for its whole body (the second
+caller waits and then finds the threads already reaped) and the joins are
+wrapped so nothing can ever throw out of a function that runs with the GVL
+released. This is a latent milestone 1 bug that only a multi-threaded
+disconnect could reach; TCP/UDP/serial behavior is unchanged.
+
+## Milestone 5 (polish): decisions
+
+- **Counters are appended, never rearranged.** `Interfaces#get_info` (and
+  therefore `get_interface_info` / `get_all_interface_info`) gained a **ninth**
+  element: a Hash of buffered counters with String keys, so a direct caller and
+  a JSON-RPC caller see the same shape. The first eight elements are exactly
+  what they always were, so every existing caller keeps working. A Hash rather
+  than more positional fields means the next counter needs no API change at
+  all, and an interface with no buffered backend answers with `false` and zeros
+  rather than nothing, so a display never has to special-case it.
+- **One statistics shape for every transport.** `BufferedIO.empty_stats`
+  defines the canonical zeroed hash and every buffered stream, interface and
+  the server aggregate build from it. `stall_count` and `ring_bytes` were added
+  to the TCP and UDP hashes for parity with serial (additive; nothing reads
+  fewer keys than before). UDP keeps its extra `buffered_datagrams` and reports
+  `stall_count` 0, which is correct: a datagram channel refuses back pressure
+  on purpose.
+- **The TCP server aggregates its clients.** A server has no stream of its own,
+  so `TcpipServerInterface#buffered_stats` sums the per-client counters, with
+  `high_water` and `ring_bytes` reported as the *worst* client rather than a
+  sum (they are per-client sizes) and a `:clients` count alongside. An operator
+  gets "is any client backing up" without enumerating clients.
+- **`StreamInterface#buffered_stats` delegates to the stream**, so serial and
+  the TCP client needed no code of their own, and a stock stream answers with
+  zeros. `Interface` itself was left alone — the CmdTlmServer side uses
+  `respond_to?`, so a router or a custom interface class needs no change.
+- **`BUFFERED_OVERFLOW` was added to the TCP client interface** for parity with
+  serial, the TCP server and UDP. Default unchanged (`backpressure`).
+
 ## Milestones
 
-1. **Core + TCP client**: BufferedChannel/StreamChannel/TcpChannel,
+1. **Core + TCP client** — *done*. BufferedChannel/StreamChannel/TcpChannel,
    BufferedTcpipClientStream/Interface, specs, the GVL-hog benchmark.
-2. **UDP** (the main drop victim): DatagramChannel/UdpChannel,
+2. **UDP** (the main drop victim) — *done*. DatagramChannel/UdpChannel,
    BufferedUdpInterface, sequence-gap proof.
-3. **Serial**: SerialChannel + BufferedSerialInterface, pty tests.
-4. **TCP server** interface + write-path polish (high-water policies,
-   flush-on-disconnect semantics).
-5. **Opt-out plumbing + docs**: `BUFFERED false` option,
-   `COSMOS_NO_BUFFERED_IO`, fallback verification, docs, CI.
+3. **Serial** — *done*. SerialChannel + BufferedSerialInterface, pty tests.
+4. **TCP server** — *done*. Per-client channels off the stock accept loop,
+   write-path composition with the server's own write thread, multi-client and
+   per-client-disconnect specs, the 4-client server benchmark.
+5. **Opt-out plumbing + docs** — *done*. `BUFFERED false` option,
+   `COSMOS_NO_BUFFERED_IO`, fallback verification, counters surfaced through
+   `get_interface_info`, and
+   [buffered_io_configuration.md](buffered_io_configuration.md).
+
+## Tuning: `RUBY_THREAD_TIMESLICE`
+
+A milestone 1 finding, recorded here because it is the other half of the same
+problem and because it is easy to reach for and easy to get wrong.
+
+Ruby 4 honors `RUBY_THREAD_TIMESLICE` (milliseconds, default 100): how long a
+thread that never yields voluntarily may hold the GVL before the scheduler
+takes it away. Measured against this code base with a thread hogging the GVL,
+`RUBY_THREAD_TIMESLICE=1` cut a starved reader's wake latency from about
+**116 ms to about 12 ms** for roughly **5% of throughput** lost to the extra
+context switching.
+
+That is worth **evaluating** for a CmdTlmServer deployment where command
+latency or timestamp accuracy matters more than raw decom throughput. COSMOS
+deliberately does **not** set it anywhere: it is a whole-VM knob whose right
+value depends entirely on the workload, and the buffered backends already
+remove the *data loss* consequence of a long timeslice — what is left is
+latency, which is a much cheaper thing to be wrong about. Measure it against
+your own configuration before adopting it.
 
 ## Non-goals / notes
 

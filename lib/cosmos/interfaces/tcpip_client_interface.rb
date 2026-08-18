@@ -63,8 +63,14 @@ module Cosmos
       BufferedIO.available?
     end
 
-    # Adds the BUFFERED option which disables the buffered C++ backend for this
-    # interface. Also supports BUFFERED_RING_BYTES to size the read ring.
+    # Supported Options
+    # BUFFERED - FALSE disables the buffered C++ backend for this interface
+    # BUFFERED_RING_BYTES - Size of the C++ read ring (default 16 MiB)
+    # BUFFERED_OVERFLOW - backpressure (default), drop_oldest or drop_newest.
+    #   TCP is lossless today and stays lossless by default; see
+    #   doc/buffered_io_design.md for why a byte stream defaults to back
+    #   pressure while UDP defaults to dropping.
+    # (see Interface#set_option)
     #
     # @param option_name (see Interface#set_option)
     # @param option_values (see Interface#set_option)
@@ -75,6 +81,8 @@ module Cosmos
         @buffered = ConfigParser.handle_true_false(option_values[0].to_s)
       when 'BUFFERED_RING_BYTES'
         @buffered_options[:ring_bytes] = Integer(option_values[0])
+      when 'BUFFERED_OVERFLOW'
+        @buffered_options[:overflow_policy] = option_values[0].to_s.downcase.to_sym
       end
     end
 
