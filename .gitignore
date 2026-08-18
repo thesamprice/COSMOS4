@@ -51,3 +51,4 @@ test/performance/outputs/tmp
 vendor/bundle/
 .bundle/
 *_segfault.txt
+python/venv/

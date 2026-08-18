@@ -520,6 +520,25 @@ DOC
       end
     end
 
+    describe "get_cmd_details" do
+      it "returns the full metadata hash for every parameter" do
+        result = @api.get_cmd_details("INST", "COLLECT")
+        expect(result).to be_a Array
+        names = result.collect { |param| param['name'] }
+        expect(names).to include('TYPE', 'DURATION', 'OPCODE', 'TEMP')
+        result.each do |param|
+          expect(param).to include('name', 'bit_offset', 'bit_size', 'data_type')
+        end
+        type = result.find { |param| param['name'] == 'TYPE' }
+        expect(type['bit_offset']).to eql 64
+        expect(type['bit_size']).to eql 16
+        # Symbols in-process; the JSON-RPC layer stringifies them on the wire
+        expect(type['data_type']).to eql :UINT
+        expect(type['states']).to eql({"NORMAL" => 0, "SPECIAL" => 1})
+        expect(type['required']).to be true
+      end
+    end
+
     describe "get_cmd_hazardous" do
       it "returns whether the command with parameters is hazardous" do
         expect(@api.get_cmd_hazardous("INST","COLLECT",{"TYPE"=>"NORMAL"})).to be false
