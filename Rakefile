@@ -148,7 +148,8 @@ task :build => [:devkit] do
       'line_graph',
       'packet',
       'platform',
-      'buffered_file']
+      'buffered_file',
+      'buffered_io']
 
     extensions.each do |extension_name|
       Dir.chdir "ext/cosmos/ext/#{extension_name}"

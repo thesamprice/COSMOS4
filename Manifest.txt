@@ -669,6 +669,12 @@ ext/cosmos/ext/array/array.c
 ext/cosmos/ext/array/extconf.rb
 ext/cosmos/ext/buffered_file/buffered_file.c
 ext/cosmos/ext/buffered_file/extconf.rb
+ext/cosmos/ext/buffered_io/buffered_channel.cpp
+ext/cosmos/ext/buffered_io/buffered_channel.h
+ext/cosmos/ext/buffered_io/buffered_io.cpp
+ext/cosmos/ext/buffered_io/extconf.rb
+ext/cosmos/ext/buffered_io/stream_channel.cpp
+ext/cosmos/ext/buffered_io/stream_channel.h
 ext/cosmos/ext/config_parser/config_parser.c
 ext/cosmos/ext/config_parser/extconf.rb
 ext/cosmos/ext/cosmos_io/cosmos_io.c
@@ -1149,6 +1155,7 @@ lib/cosmos/interfaces/tcpip_client_interface.rb
 lib/cosmos/interfaces/tcpip_server_interface.rb
 lib/cosmos/interfaces/udp_interface.rb
 lib/cosmos/io/buffered_file.rb
+lib/cosmos/io/buffered_io.rb
 lib/cosmos/io/cosmos_snmp.rb
 lib/cosmos/io/io_multiplexer.rb
 lib/cosmos/io/json_drb.rb
@@ -1205,6 +1212,8 @@ lib/cosmos/script/script.rb
 lib/cosmos/script/scripting.rb
 lib/cosmos/script/telemetry.rb
 lib/cosmos/script/tools.rb
+lib/cosmos/streams/buffered_tcpip_client_stream.rb
+lib/cosmos/streams/buffered_tcpip_socket_stream.rb
 lib/cosmos/streams/serial_stream.rb
 lib/cosmos/streams/stream.rb
 lib/cosmos/streams/tcpip_client_stream.rb
@@ -1524,6 +1533,8 @@ spec/script/scripting_spec.rb
 spec/script/telemetry_spec.rb
 spec/script/tools_spec.rb
 spec/spec_helper.rb
+spec/streams/buffered_tcpip_client_stream_spec.rb
+spec/streams/buffered_tcpip_socket_stream_spec.rb
 spec/streams/serial_stream_spec.rb
 spec/streams/stream_spec.rb
 spec/streams/tcpip_client_stream_spec.rb
@@ -1562,6 +1573,7 @@ tasks/gemfile_stats.rake
 tasks/manifest.rake
 tasks/spec.rake
 test/benchmarks/binary_accessor_benchmark.rb
+test/benchmarks/buffered_io_bench.rb
 test/benchmarks/gsub_benchmark.rb
 test/benchmarks/is_a_benchmark.rb
 test/performance/PACKETS.bat
