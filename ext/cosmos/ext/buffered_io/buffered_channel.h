@@ -58,9 +58,12 @@ enum class WritePolicy { BLOCK = 0, RAISE };
 //
 //   BACKPRESSURE - stop reading the descriptor until Ruby drains the ring.
 //                  For TCP this restores exactly the lossless flow control the
-//                  pure Ruby stream has today, so it is the stream default.
-//   DROP_OLDEST  - freshest data wins (the right answer for UDP and serial,
-//                  where the kernel would otherwise drop silently).
+//                  pure Ruby stream has today, and for serial it keeps RTS/CTS
+//                  working and never splices a byte stream mid frame, so it is
+//                  the default for both (see doc/buffered_io_design.md).
+//   DROP_OLDEST  - freshest data wins (the right answer for UDP, where a
+//                  datagram is a self contained sample and the kernel would
+//                  otherwise drop it silently).
 //   DROP_NEWEST  - keep the oldest data and discard what does not fit.
 //
 // Every dropped byte is counted in drop_count.

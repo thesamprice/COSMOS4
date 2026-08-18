@@ -38,6 +38,7 @@
 #include "ruby/thread.h"
 
 #include "datagram_channel.h"
+#include "serial_channel.h"
 #include "stream_channel.h"
 
 using cosmos::BufferedChannel;
@@ -45,6 +46,7 @@ using cosmos::ChannelStatus;
 using cosmos::Clock;
 using cosmos::Datagram;
 using cosmos::DatagramChannel;
+using cosmos::SerialChannel;
 using cosmos::StreamChannel;
 using cosmos::TcpChannel;
 using cosmos::UdpChannel;
@@ -265,6 +267,18 @@ static void raise_status(ChannelStatus status, int err) {
  * Duplicates the given descriptor (so Ruby stays free to close its own copy
  * whenever it likes), starts the reader and writer threads and returns the
  * channel.
+ *
+ * Two kinds of byte stream descriptor are adopted, and which one it is decides
+ * how the reader thread is unblocked for a clean join:
+ *
+ *   socket (M1)  - TcpChannel. Blocking recv(2), broken by shutdown(2).
+ *   tty (M3)     - SerialChannel. shutdown(2) is meaningless on a character
+ *                  device, so the reader parks in poll(2) on the tty plus a
+ *                  self-pipe (the mechanism M2 introduced for unconnected UDP
+ *                  sockets) and the descriptor is driven non blocking.
+ *
+ * Anything else - a regular file, a pipe - is refused, and the caller falls
+ * back to the stock Ruby path.
  */
 static VALUE channel_adopt(int argc, VALUE* argv, VALUE klass) {
   VALUE fileno_value = Qnil;
@@ -278,12 +292,13 @@ static VALUE channel_adopt(int argc, VALUE* argv, VALUE klass) {
     if (requested > 0) ring_bytes = (size_t)requested;
   }
 
-  /* M1 adopts sockets only: shutdown(2) is what guarantees the reader thread
-   * can always be unblocked for a clean join. */
   int socket_type = 0;
   socklen_t socket_type_length = sizeof(socket_type);
-  if (::getsockopt(fileno, SOL_SOCKET, SO_TYPE, &socket_type, &socket_type_length) != 0) {
-    rb_raise(rb_eArgError, "buffered channel requires a socket descriptor");
+  bool is_socket =
+      (::getsockopt(fileno, SOL_SOCKET, SO_TYPE, &socket_type, &socket_type_length) == 0);
+  bool is_tty = !is_socket && (::isatty(fileno) != 0);
+  if (!is_socket && !is_tty) {
+    rb_raise(rb_eArgError, "buffered channel requires a socket or tty descriptor");
   }
 
   int duplicate = ::dup(fileno);
@@ -291,12 +306,24 @@ static VALUE channel_adopt(int argc, VALUE* argv, VALUE klass) {
 #ifdef FD_CLOEXEC
   ::fcntl(duplicate, F_SETFD, FD_CLOEXEC);
 #endif
-  /* The Ruby socket may be non blocking; our threads want to park in the
-   * kernel instead. */
-  int flags = ::fcntl(duplicate, F_GETFL, 0);
-  if (flags >= 0) ::fcntl(duplicate, F_SETFL, flags & ~O_NONBLOCK);
 
-  StreamChannel* channel = new TcpChannel(duplicate, ring_bytes);
+  StreamChannel* channel = NULL;
+  int flags = ::fcntl(duplicate, F_GETFL, 0);
+  if (is_tty) {
+    /* dup(2) shares the file status flags with Ruby's descriptor, which is
+     * harmless here: PosixSerialDriver only ever uses read_nonblock and
+     * write_nonblock, both of which handle EAGAIN. Non blocking is what lets
+     * every wait happen in poll(2), where the self-pipe can reach it - a
+     * thread parked in a blocking tty read(2) cannot be joined at all. */
+    if (flags >= 0) ::fcntl(duplicate, F_SETFL, flags | O_NONBLOCK);
+    channel = new SerialChannel(duplicate, ring_bytes);
+  } else {
+    /* The Ruby socket may be non blocking; our threads want to park in the
+     * kernel instead. */
+    if (flags >= 0) ::fcntl(duplicate, F_SETFL, flags & ~O_NONBLOCK);
+    channel = new TcpChannel(duplicate, ring_bytes);
+  }
+
   VALUE self = TypedData_Wrap_Struct(klass, &channel_data_type, channel);
   register_channel(channel);
   channel->start();
@@ -507,6 +534,19 @@ static VALUE channel_pending_write_bytes(VALUE self) {
 
 static VALUE channel_ring_bytes(VALUE self) {
   return ULL2NUM((unsigned long long)get_channel(self)->ring_bytes());
+}
+
+/* True when this channel was adopted from a tty (a serial port). */
+static VALUE channel_tty(VALUE self) {
+  return get_channel(self)->is_tty() ? Qtrue : Qfalse;
+}
+
+/* Times the reader stopped reading the descriptor because the ring was full.
+ * Only :backpressure can stall; the drop policies count bytes in drop_count
+ * instead. Nonzero means Ruby is not draining fast enough - the condition
+ * that overruns the tty input buffer if it persists. */
+static VALUE channel_stall_count(VALUE self) {
+  return ULL2NUM(get_channel(self)->stall_count());
 }
 
 static VALUE channel_fileno(VALUE self) {
@@ -860,6 +900,8 @@ extern "C" void Init_buffered_io(void) {
   rb_define_method(cStreamChannel, "pending_write_bytes",
                    RUBY_METHOD_FUNC(channel_pending_write_bytes), 0);
   rb_define_method(cStreamChannel, "ring_bytes", RUBY_METHOD_FUNC(channel_ring_bytes), 0);
+  rb_define_method(cStreamChannel, "stall_count", RUBY_METHOD_FUNC(channel_stall_count), 0);
+  rb_define_method(cStreamChannel, "tty?", RUBY_METHOD_FUNC(channel_tty), 0);
   rb_define_method(cStreamChannel, "fileno", RUBY_METHOD_FUNC(channel_fileno), 0);
   rb_define_method(cStreamChannel, "write_policy", RUBY_METHOD_FUNC(channel_write_policy), 0);
   rb_define_method(cStreamChannel, "write_policy=", RUBY_METHOD_FUNC(channel_set_write_policy), 1);

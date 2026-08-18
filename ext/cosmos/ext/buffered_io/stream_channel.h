@@ -62,6 +62,17 @@ public:
 
   size_t ring_bytes() const { return ring_.size(); }
 
+  // True for a channel adopted from a character device (SerialChannel).
+  virtual bool is_tty() const { return false; }
+
+  // How many times the reader thread had to stop reading the descriptor
+  // because the ring was full (BACKPRESSURE only). Under back pressure no
+  // byte is ever dropped by us, so drop_count stays zero and the loss - if
+  // any - happens further upstream (the tty input buffer, the peer's send
+  // window). This counter is what makes "Ruby is not draining fast enough"
+  // visible before that happens.
+  uint64_t stall_count() const { return stall_count_.load(); }
+
   OverflowPolicy overflow_policy() const { return overflow_policy_.load(); }
   void set_overflow_policy(OverflowPolicy policy);
 
@@ -77,6 +88,11 @@ protected:
   virtual void notify_all();
   virtual void release_buffers();
 
+  // Blocks (on ring_space_cv_) while BACKPRESSURE is in force and the ring is
+  // full, then clamps request to the space actually available. Returns 0 when
+  // the channel is stopping. Shared by every stream reader loop.
+  size_t reserve_read_space(size_t request);
+
   // Must be called with mutex_ held.
   void ring_push(const unsigned char* data, size_t length, double timestamp);
   size_t ring_pop(std::string& out, size_t max_bytes, double* timestamp);
@@ -87,6 +103,7 @@ protected:
   size_t ring_count_; // bytes currently buffered
 
   std::atomic<OverflowPolicy> overflow_policy_;
+  std::atomic<uint64_t> stall_count_;
   // Signalled when Ruby frees ring space (only used by BACKPRESSURE)
   std::condition_variable ring_space_cv_;
 

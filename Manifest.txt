@@ -675,6 +675,8 @@ ext/cosmos/ext/buffered_io/buffered_io.cpp
 ext/cosmos/ext/buffered_io/datagram_channel.cpp
 ext/cosmos/ext/buffered_io/datagram_channel.h
 ext/cosmos/ext/buffered_io/extconf.rb
+ext/cosmos/ext/buffered_io/serial_channel.cpp
+ext/cosmos/ext/buffered_io/serial_channel.h
 ext/cosmos/ext/buffered_io/stream_channel.cpp
 ext/cosmos/ext/buffered_io/stream_channel.h
 ext/cosmos/ext/config_parser/config_parser.c
@@ -1215,6 +1217,7 @@ lib/cosmos/script/scripting.rb
 lib/cosmos/script/telemetry.rb
 lib/cosmos/script/tools.rb
 lib/cosmos/streams/buffered_tcpip_client_stream.rb
+lib/cosmos/streams/buffered_serial_stream.rb
 lib/cosmos/streams/buffered_tcpip_socket_stream.rb
 lib/cosmos/streams/serial_stream.rb
 lib/cosmos/streams/stream.rb
@@ -1467,6 +1470,7 @@ spec/install/config/targets/SYSTEM/target.txt
 spec/install/config/tools/cmd_tlm_server/cmd_tlm_server.txt
 spec/install/lib/README.txt
 spec/install/yaml_docs_spec.rb
+spec/interfaces/buffered_serial_interface_spec.rb
 spec/interfaces/buffered_udp_interface_spec.rb
 spec/interfaces/cmd_tlm_server_interface_spec.rb
 spec/interfaces/interface_spec.rb
@@ -1536,6 +1540,7 @@ spec/script/scripting_spec.rb
 spec/script/telemetry_spec.rb
 spec/script/tools_spec.rb
 spec/spec_helper.rb
+spec/streams/buffered_serial_stream_spec.rb
 spec/streams/buffered_tcpip_client_stream_spec.rb
 spec/streams/buffered_tcpip_socket_stream_spec.rb
 spec/streams/serial_stream_spec.rb
