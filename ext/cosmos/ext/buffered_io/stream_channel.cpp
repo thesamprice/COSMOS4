@@ -183,6 +183,17 @@ ChannelStatus StreamChannel::read(std::string& out, size_t max_bytes,
   }
 }
 
+// Hand the ring back to the allocator as soon as the channel is stopped. The
+// threads are joined by now and a stopped channel reports DISCONNECTED rather
+// than serving data, so nothing can observe the empty ring.
+void StreamChannel::release_buffers() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<unsigned char>().swap(ring_);
+  std::deque<TimeMark>().swap(marks_);
+  ring_head_ = 0;
+  ring_count_ = 0;
+}
+
 void StreamChannel::notify_all() {
   BufferedChannel::notify_all();
   ring_space_cv_.notify_all();

@@ -33,11 +33,7 @@ BufferedChannel::BufferedChannel(int fd)
       writing_bytes_(0) {}
 
 BufferedChannel::~BufferedChannel() {
-  stop(0.0);
-  if (fd_ >= 0) {
-    ::close(fd_);
-    fd_ = -1;
-  }
+  stop(0.0); // joins the threads and closes the descriptor
 }
 
 void BufferedChannel::start() {
@@ -86,6 +82,26 @@ ssize_t BufferedChannel::transport_read(void* buffer, size_t length) {
 
 ssize_t BufferedChannel::transport_write(const void* buffer, size_t length) {
   return ::write(fd_, buffer, length);
+}
+
+// Byte stream default: keep writing until the whole item has been handed to
+// the kernel. Behavior is identical to the loop this replaced.
+bool BufferedChannel::transport_send_item(const std::string& item) {
+  size_t offset = 0;
+  while (offset < item.size()) {
+    ssize_t sent = transport_write(item.data() + offset, item.size() - offset);
+    if (sent > 0) {
+      offset += (size_t)sent;
+      bytes_written_.fetch_add((uint64_t)sent);
+    } else if (sent < 0) {
+      if (errno == EINTR) continue;
+      latch_errno(errno);
+      return false;
+    } else {
+      break;
+    }
+  }
+  return true;
 }
 
 void BufferedChannel::shutdown_fd() {
@@ -160,22 +176,7 @@ void BufferedChannel::writer_loop() {
       writing_bytes_ = item.size();
     }
 
-    size_t offset = 0;
-    bool failed = false;
-    while (offset < item.size()) {
-      ssize_t sent = transport_write(item.data() + offset, item.size() - offset);
-      if (sent > 0) {
-        offset += (size_t)sent;
-        bytes_written_.fetch_add((uint64_t)sent);
-      } else if (sent < 0) {
-        if (errno == EINTR) continue;
-        latch_errno(errno);
-        failed = true;
-        break;
-      } else {
-        break;
-      }
-    }
+    bool failed = !transport_send_item(item);
 
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -189,12 +190,15 @@ void BufferedChannel::writer_loop() {
 void BufferedChannel::stop(double flush_timeout_s) {
   if (!started_.load()) {
     stop_.store(true);
+    close_fd();
     return;
   }
   if (stop_.load()) {
     // Already stopping/stopped - just make sure the threads are reaped.
     if (reader_thread_.joinable()) reader_thread_.join();
     if (writer_thread_.joinable()) writer_thread_.join();
+    close_fd();
+    release_buffers();
     return;
   }
 
@@ -215,6 +219,18 @@ void BufferedChannel::stop(double flush_timeout_s) {
 
   if (reader_thread_.joinable()) reader_thread_.join();
   if (writer_thread_.joinable()) writer_thread_.join();
+  close_fd();
+  release_buffers();
+}
+
+// Both threads are joined by every caller, so nothing can reference the
+// descriptor any more. Released here rather than in the destructor: file
+// descriptors are not memory pressure, so waiting for GC to run would let a
+// long lived server exhaust them across reconnect cycles.
+void BufferedChannel::close_fd() {
+  int descriptor = fd_;
+  fd_ = -1;
+  if (descriptor >= 0) ::close(descriptor);
 }
 
 } // namespace cosmos

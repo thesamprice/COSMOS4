@@ -75,6 +75,7 @@ public:
 protected:
   virtual void reader_loop();
   virtual void notify_all();
+  virtual void release_buffers();
 
   // Must be called with mutex_ held.
   void ring_push(const unsigned char* data, size_t length, double timestamp);
