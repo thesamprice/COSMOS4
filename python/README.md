@@ -10,8 +10,10 @@ Two ways in:
    against this modernized COSMOS — see `verify_api.py`'s cross-check).
    **Note**: stock ballcosmos corrupts binary parameters (bytes >= 0x80
    get re-encoded as UTF-8 on the wire) and lacks `get_cmd_details`.
-   Both are fixed on the fork:
-   `pip install git+https://github.com/thesamprice/python-ballcosmos@get-cmd-details-and-binary-fix`
+   Both are fixed (along with a connection-reset port leak) on the
+   maintained fork — upstream is archived and takes no PRs, so the
+   fork's master is the living line (v2.1.0):
+   `pip install git+https://github.com/thesamprice/python-ballcosmos`
 2. **`cosmos_api.py`** (here): a stdlib-only clone of its core. One
    class, one method: `CosmosApi().call(method, *params)`.
 
