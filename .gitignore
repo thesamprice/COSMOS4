@@ -52,3 +52,5 @@ vendor/bundle/
 .bundle/
 *_segfault.txt
 python/venv/
+__pycache__/
+*.pyc
