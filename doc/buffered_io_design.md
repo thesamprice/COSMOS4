@@ -106,12 +106,16 @@ BufferedUdpInterface         < UdpInterface         # UdpChannel under read_inte
 
 ### Rollout
 
-1. **Opt-in**: the buffered classes are selectable from
-   `cmd_tlm_server.txt` today (`INTERFACE ... buffered_serial_interface.rb ...`)
-   with identical parameters.
-2. **Default flip**: interface declarations grow a `BUFFERED false`
-   opt-out keyword; the stock interfaces become aliases for the
-   buffered ones once parity is proven.
+**Buffered is the default.** As each transport lands, the stock class
+(`SerialInterface`, `TcpipClientInterface`, `UdpInterface`, ...) routes
+through the buffered channel automatically — existing config files get
+the fix with no changes. Opting out:
+
+- per interface: a `BUFFERED false` interface option in
+  `cmd_tlm_server.txt`
+- globally: `COSMOS_NO_BUFFERED_IO=1` (also the automatic fallback when
+  the extension is not built, e.g. platforms the first pass does not
+  cover), which uses the original pure-Ruby paths unchanged.
 
 ## Verification
 
@@ -136,7 +140,8 @@ BufferedUdpInterface         < UdpInterface         # UdpChannel under read_inte
 3. **Serial**: SerialChannel + BufferedSerialInterface, pty tests.
 4. **TCP server** interface + write-path polish (high-water policies,
    flush-on-disconnect semantics).
-5. **Default flip**: `BUFFERED` keyword, stock aliases, docs, CI.
+5. **Opt-out plumbing + docs**: `BUFFERED false` option,
+   `COSMOS_NO_BUFFERED_IO`, fallback verification, docs, CI.
 
 ## Non-goals / notes
 
@@ -147,6 +152,6 @@ BufferedUdpInterface         < UdpInterface         # UdpChannel under read_inte
 - Thread-per-channel blocking syscalls are already fully event-driven
   (the kernel parks the thread); the no-polling requirement is about
   sleep loops and timers, of which there are none.
-- Windows (overlapped I/O) is out of scope for the first pass; the
-  Ruby classes fall back to the stock streams where the extension is
-  unavailable.
+- Windows (overlapped I/O) is out of scope for the first pass; where
+  the extension is unavailable the stock pure-Ruby paths are used
+  automatically (same mechanism as the opt-out).
