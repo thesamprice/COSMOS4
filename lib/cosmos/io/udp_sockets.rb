@@ -121,12 +121,11 @@ module Cosmos
     # @return [Boolean] Whether the hostname is multicast
     def self.multicast?(host)
       return false if host.nil?
-      # Look up address
-      _, _, _, *address_list = Socket.gethostbyname(host)
+      # Look up address (Socket.gethostbyname is deprecated)
       first_addr_byte = 0
-      address_list.each do |address|
-        if address.length == 4
-          first_addr_byte = address.getbyte(0)
+      Addrinfo.getaddrinfo(host, nil).each do |addrinfo|
+        if addrinfo.ipv4?
+          first_addr_byte = addrinfo.ip_address.split('.').first.to_i
           break
         end
       end

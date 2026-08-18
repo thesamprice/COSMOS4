@@ -28,6 +28,10 @@ module Kernel
   # @param start [Integer] The number of stack entries to skip
   # @return [Symbol] The name of the calling method
   def calling_method(start = 1)
-    caller[start][/`([^']*)'/, 1].intern
+    # Handles both the pre-3.4 backtrace format "in `method'" and the
+    # Ruby 3.4+ format "in 'Class#method'"
+    method = caller[start][/[`']([^']*)'/, 1]
+    method = method.split('#').last.split('.').last
+    method.intern
   end
 end

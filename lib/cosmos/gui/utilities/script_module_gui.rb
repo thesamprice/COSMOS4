@@ -14,49 +14,57 @@ require 'cosmos/tools/tlm_viewer/screen'
 
 $cmd_tlm_gui_window = nil
 
+# qtbindings dispatched every Qt call through Qt::Base#method_missing, so a
+# reopened #exec could re-enter it to reach the C++ QDialog::exec(). The Qt 6
+# bindings define exec as a real method on the class, so redefining it here
+# replaces it outright and method_missing(:exec) would recurse. Alias the
+# original first and call that instead (same pattern as Qt::TreeWidgetItem and
+# Qt::Painter in lib/cosmos/gui/qt.rb).
 class Qt::Dialog
+  alias_method :qt6_exec, :exec if method_defined?(:exec) && !method_defined?(:qt6_exec)
+
   def exec(*args)
     Cosmos.play_wav_file(Cosmos.data_path('message.wav')) if Cosmos::System.sound
-    method_missing(:exec, *args)
+    qt6_exec(*args)
   end
 end
 class Qt::MessageBox
-  def exec(*args)
-    Cosmos.play_wav_file(Cosmos.data_path('message.wav')) if Cosmos::System.sound
-    method_missing(:exec, *args)
-  end
-  def self.critical(parent, title, text,
-                    buttons = Qt::MessageBox::Ok,
-                    defaultButton = Qt::MessageBox::NoButton)
-    # Windows overrides critical dialogs with its own alert sound
-    Cosmos.play_wav_file(Cosmos.data_path('critical.wav')) if Cosmos::System.sound
-    super(parent,title,text,buttons,defaultButton)
-  end
-  def self.information(parent, title, text,
-                       buttons = Qt::MessageBox::Ok,
-                       defaultButton = Qt::MessageBox::NoButton)
-    Cosmos.play_wav_file(Cosmos.data_path('information.wav')) if Cosmos::System.sound
-    super(parent,title,text,buttons,defaultButton)
-  end
-  def self.question(parent, title, text,
-                    buttons = Qt::MessageBox::Ok,
-                    defaultButton = Qt::MessageBox::NoButton)
-    Cosmos.play_wav_file(Cosmos.data_path('question.wav')) if Cosmos::System.sound
-    super(parent,title,text,buttons,defaultButton)
-  end
-  def self.warning(parent, title, text,
-                   buttons = Qt::MessageBox::Ok,
-                   defaultButton = Qt::MessageBox::NoButton)
-    # Windows overrides warning dialogs with its own alert sound
-    Cosmos.play_wav_file(Cosmos.data_path('warning.wav')) if Cosmos::System.sound
-    super(parent,title,text,buttons,defaultButton)
+  # No #exec reopen here: the Qt 6 bindings define exec only on Qt::Dialog
+  # (QMessageBox inherits it), so QMessageBox already picks up the chime from
+  # the Qt::Dialog reopen above. Redefining it here would alias that reopened
+  # Ruby method as "the original" and recurse forever.
+  #
+  # critical/information/question/warning are generated straight onto this
+  # class's singleton, so `super` from a redefinition here finds nothing (it
+  # would search Qt::Dialog's singleton, which has no such static). Alias each
+  # original onto the singleton and call that instead.
+  class << self
+    { 'critical' => 'critical.wav', # Windows overrides critical dialogs with its own alert sound
+      'information' => 'information.wav',
+      'question' => 'question.wav',
+      'warning' => 'warning.wav' }.each do |meth, wav| # ditto warning
+      next unless method_defined?(meth)
+      # Idempotent: spec_helper re-loads files, and re-aliasing would capture
+      # the reopened method and recurse
+      alias_method("qt6_#{meth}", meth) unless method_defined?("qt6_#{meth}")
+      define_method(meth) do |parent, title, text,
+                             buttons = Qt::MessageBox::Ok,
+                             defaultButton = Qt::MessageBox::NoButton|
+        Cosmos.play_wav_file(Cosmos.data_path(wav)) if Cosmos::System.sound
+        send("qt6_#{meth}", parent, title, text, buttons, defaultButton)
+      end
+    end
   end
 end
 
 class Qt::InputDialog
-  def self.getText(*args)
-    Cosmos.play_wav_file(Cosmos.data_path('input.wav')) if Cosmos::System.sound
-    super(*args)
+  class << self
+    alias_method :qt6_getText, :getText if method_defined?(:getText) && !method_defined?(:qt6_getText)
+
+    def getText(*args)
+      Cosmos.play_wav_file(Cosmos.data_path('input.wav')) if Cosmos::System.sound
+      qt6_getText(*args)
+    end
   end
 end
 

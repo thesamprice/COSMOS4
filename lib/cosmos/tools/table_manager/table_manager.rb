@@ -889,9 +889,18 @@ module Cosmos
     # prepare for the next table to load.
     def reset_gui
       set_table_modified(false)
-      @tabbook.tabs.each_with_index do |tab, index|
+      # Always remove index 0: removeTab shifts every later tab down, so
+      # walking the tabs with their original indexes skips half of them. That
+      # used to be masked by dispose deleting the widget immediately, which
+      # made Qt drop the page from the tab bar as a side effect; the Qt 6
+      # bindings dispose via deleteLater, so the tab is still there when
+      # removeTab runs and the stale indexes leave tabs behind for the next
+      # file to be added after. Remove first, then dispose, so the widget is
+      # already detached from the tab bar when it goes away.
+      while @tabbook.count > 0
+        tab = @tabbook.widget(0)
+        @tabbook.removeTab(0)
         tab.dispose
-        @tabbook.removeTab(index)
       end
     end
 

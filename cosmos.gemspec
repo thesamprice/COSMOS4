@@ -55,8 +55,7 @@ spec = Gem::Specification.new do |s|
     s.extensions << 'ext/cosmos/ext/cosmos_io/extconf.rb'
     s.extensions << 'ext/cosmos/ext/crc/extconf.rb'
     s.extensions << 'ext/cosmos/ext/line_graph/extconf.rb'
-    s.extensions << 'ext/cosmos/ext/low_fragmentation_array/extconf.rb'
-    s.extensions << 'ext/cosmos/ext/packet/extconf.rb'
+      s.extensions << 'ext/cosmos/ext/packet/extconf.rb'
     s.extensions << 'ext/cosmos/ext/platform/extconf.rb'
     s.extensions << 'ext/cosmos/ext/polynomial_conversion/extconf.rb'
     s.extensions << 'ext/cosmos/ext/string/extconf.rb'
@@ -73,42 +72,49 @@ spec = Gem::Specification.new do |s|
       files
     else [] end
 
-  s.required_ruby_version = '~> 2.4'
+  s.required_ruby_version = '>= 3.1'
 
   # Runtime Dependencies
   s.add_runtime_dependency 'bundler', '>= 1.3'
-  s.add_runtime_dependency 'psych', '~> 3.3'
+  s.add_runtime_dependency 'psych', '>= 3.3', '< 6'
   s.add_runtime_dependency 'rdoc', '>= 4' # qtbindings doesn't parse in 6.0.0, fixed in 6.0.1
   s.add_runtime_dependency 'rake', '>= 10.0' # 10.0 released Nov 12, 2012
   s.add_runtime_dependency 'json', '>= 1.5', '< 3' # 2.0+ works with COSMOS
-  s.add_runtime_dependency 'pry', '~> 0.9'
-  s.add_runtime_dependency 'pry-doc', '~> 0.5'
+  s.add_runtime_dependency 'pry', '~> 0.14'
+  s.add_runtime_dependency 'pry-doc', '>= 0.5'
   s.add_runtime_dependency 'yard', '~> 0.9.11'
   s.add_runtime_dependency 'uuidtools', '~> 2.1'
   s.add_runtime_dependency 'snmp', '~> 1.0'
-  s.add_runtime_dependency 'rubyzip', '~> 1.2'
-  s.add_runtime_dependency 'nokogiri', ['~> 1.10', '< 1.13'] # Nokogiri 1.13 doesn't support Ruby 2.5
+  s.add_runtime_dependency 'rubyzip', '~> 2.3'
+  s.add_runtime_dependency 'nokogiri', '~> 1.14'
   s.add_runtime_dependency 'opengl-bindings', '~> 1.6' if RUBY_ENGINE == 'ruby' # MRI Only
 #  s.add_runtime_dependency 'qtbindings', '~> 4.8.6', '>= 4.8.6.2' if RUBY_ENGINE == 'ruby' && !ENV['CI'] # MRI Only, not Github
-  s.add_runtime_dependency 'puma', '~> 3.10'
-  s.add_runtime_dependency 'rack', '~> 2.0'
+  s.add_runtime_dependency 'puma', '~> 6.0'
+  s.add_runtime_dependency 'rack', '>= 2.2', '< 4'
   s.add_runtime_dependency 'httpclient', '~> 2.8'
+  # Stdlib libraries extracted to gems in Ruby 3.4+
+  s.add_runtime_dependency 'ostruct'
+  s.add_runtime_dependency 'csv'
+  s.add_runtime_dependency 'benchmark'
+  s.add_runtime_dependency 'irb'
+  s.add_runtime_dependency 'matrix'
+  s.add_runtime_dependency 'drb'
 
   # Development Dependencies
   s.add_development_dependency 'diff-lcs', '~> 1.3' if RUBY_ENGINE == 'ruby' # Get latest for MRI
   s.add_development_dependency 'rspec', '~> 3.5'
   s.add_development_dependency 'flog', '~> 4.0'
   s.add_development_dependency 'flay', '~> 2.0'
-  s.add_development_dependency 'reek', '~> 5.0'
+  s.add_development_dependency 'reek', '>= 5.0'
   s.add_development_dependency 'roodi', '~> 5.0'
   s.add_development_dependency 'guard', '~> 2.0'
   s.add_development_dependency 'listen', '~> 3.0'
   s.add_development_dependency 'guard-bundler', '~> 2.0'
   s.add_development_dependency 'guard-rspec', '~> 4.0'
-  s.add_development_dependency 'simplecov', '~> 0.15'
+  s.add_development_dependency 'simplecov', '>= 0.15'
   s.add_development_dependency 'codecov', '~> 0.1'
-  s.add_development_dependency 'benchmark-ips', '= 2.7.2'
-  s.add_development_dependency 'ruby-prof', ['~> 1.0', '< 1.3'] if RUBY_ENGINE == 'ruby' # MRI Only
+  s.add_development_dependency 'benchmark-ips', '>= 2.7'
+  s.add_development_dependency 'ruby-prof', '~> 1.0' if RUBY_ENGINE == 'ruby' # MRI Only
 
   s.post_install_message = "Thanks for installing Ball Aerospace COSMOS!\nStart your first project with: cosmos demo demo\n"
 end

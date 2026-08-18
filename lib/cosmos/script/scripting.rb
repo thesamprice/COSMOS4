@@ -57,19 +57,19 @@ module Cosmos
     end
 
     def prompt(string, **options)
-      prompt_to_continue(string, options)
+      prompt_to_continue(string, **options)
     end
 
     def message_box(string, *buttons, **options)
-      prompt_message_box(string, buttons, options)
+      prompt_message_box(string, buttons, **options)
     end
 
     def vertical_message_box(string, *buttons, **options)
-      prompt_vertical_message_box(string, buttons, options)
+      prompt_vertical_message_box(string, buttons, **options)
     end
 
     def combo_box(string, *items, **options)
-      prompt_combo_box(string, items, options)
+      prompt_combo_box(string, items, **options)
     end
 
     def _file_dialog(message, directory, filter, select_files = true)
@@ -135,12 +135,12 @@ module Cosmos
       gets.chomp
     end
 
-    def prompt_vertical_message_box(string, buttons, options)
-      prompt_message_box(string, buttons, options)
+    def prompt_vertical_message_box(string, buttons, **options)
+      prompt_message_box(string, buttons, **options)
     end
 
-    def prompt_combo_box(string, items, options)
-      prompt_message_box(string, items, options)
+    def prompt_combo_box(string, items, **options)
+      prompt_message_box(string, items, **options)
     end
   end
 end

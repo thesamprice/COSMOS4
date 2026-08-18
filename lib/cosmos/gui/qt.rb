@@ -14,74 +14,17 @@
 
 require 'stringio'
 require 'cosmos'
-check_filename = File.join(Cosmos::USERPATH, "#{File.basename($0, File.extname($0))}_qt_check.txt")
-qt_in_system_folder = false
 
-# Check for Qt dlls in Window system folders
-if Kernel.is_windows?
-  windir =  ENV['SystemRoot']
-  if windir
-    # Check Windows system folders for existing Qt dll files
-    ['system', 'SysWOW64', 'System32'].each do |folder|
-      break if qt_in_system_folder
-      ['libgcc_s_dw2-1.dll',
-       'mingwm10.dll',
-       'phonon4.dll',
-       'Qt3Support4.dll',
-       'QtCLucene4.dll',
-       'QtCore4.dll',
-       'QtDeclarative4.dll',
-       'QtDesigner4.dll',
-       'QtDesignerComponents4.dll',
-       'QtGui4.dll',
-       'QtHelp4.dll',
-       'QtMultimedia4.dll',
-       'QtNetwork4.dll',
-       'QtOpenGL4.dll',
-       'QtScript4.dll',
-       'QtScriptTools4.dll',
-       'QtSql4.dll',
-       'QtSvg4.dll',
-       'QtTest4.dll',
-       'QtWebKit4.dll',
-       'QtXml4.dll',
-       'QtXmlPatterns4.dll'].each do |qtfilename|
-        break if qt_in_system_folder
-        filename = File.join(windir, folder, qtfilename)
-        if File.exist?(filename)
-          qt_in_system_folder = true
-
-          # Is this the first time we've detected this?
-          if File.exist?(check_filename)
-            # We tried before and failed
-            File.delete(check_filename)
-
-            if $0 =~ /Launcher/
-              require 'cosmos/win32/win32'
-              Cosmos::Win32.message_box("Found conflicting Qt dll file at: #{filename}\nPlease overwrite all Qt dlls in the Windows system folders with the newest Qt4 version (or delete them).")
-            end
-            raise "Found conflicting Qt dll file at: #{filename}. Please overwrite all Qt dlls in the Windows system folders with the newest Qt4 version (or delete them)."
-          else
-            # First Time we've detected this - We'll create it and risk just requiring Qt once
-            File.open(check_filename, 'w') {|file| file.write("Qt Dll Check In Progress")}
-          end
-        end
-      end
-    end
-  end
-end
-
-if Kernel.is_windows?
-  temp_stderr = $stderr.clone
-  $stderr.reopen(File.new('nul', 'w'))
-end
-# This will either lock up or raise an error if older Qt dlls are present in the Windows system folders
+# Load the Qt bindings: prefer the new libclang-generated Qt 6 bindings
+# (qtbindings qt6-libclang branch), fall back to the legacy Qt 4 qtbindings
+# gem (COSMOS_QT4=1 installs). Set COSMOS_QT6_LIB to the qtbindings lib
+# directory if it is not already on the load path.
+$LOAD_PATH.unshift(ENV['COSMOS_QT6_LIB']) if ENV['COSMOS_QT6_LIB']
 begin
+  require 'qt6'
+rescue LoadError
   require 'Qt'
-ensure
-  $stderr.reopen(temp_stderr) if Kernel.is_windows?
 end
-File.delete(check_filename) if Kernel.is_windows? and File.exist?(check_filename)
 
 module Cosmos
   BIN_FILE_PATTERN = "Bin Files (*.bin);;All Files (*)"
@@ -240,7 +183,12 @@ module Cosmos
   def self.load_cosmos_icon(name='COSMOS_64x64.png')
     icon = Cosmos.get_icon(name, false)
     icon = Cosmos.get_icon('COSMOS_64x64.png', false) unless icon
-    Qt::Application.instance.setWindowIcon(icon) if icon
+    # setWindowIcon is a static in Qt 6
+    if Qt::Application.respond_to?(:setWindowIcon)
+      Qt::Application.setWindowIcon(icon) if icon
+    else
+      Qt::Application.instance.setWindowIcon(icon) if icon
+    end
     return icon
   end
 
@@ -289,7 +237,12 @@ end
 class Qt::Dialog
   def initialize(parent = Qt::Application.activeWindow,
                  flags = (Qt::WindowTitleHint | Qt::WindowSystemMenuHint))
+    # Subclasses (e.g. QMessageBox) may not have a (parent, flags) C++
+    # constructor; fall back to parent-only and set the flags after
     super(parent, flags)
+  rescue ArgumentError
+    super(parent)
+    setWindowFlags(flags)
   end
 end
 
@@ -391,36 +344,14 @@ class Qt::TreeWidgetItem
     end
   end
 
-  # Define the default column to be 0
-  def background(column = 0)
-    super(column)
-  end
-  def checkState(column = 0)
-    super(column)
-  end
-  def font(column = 0)
-    super(column)
-  end
-  def foreground(column = 0)
-    super(column)
-  end
-  def icon(column = 0)
-    super(column)
-  end
-  def statusTip(column = 0)
-    super(column)
-  end
-  def sizeHint(column = 0)
-    super(column)
-  end
-  def text(column = 0)
-    super(column)
-  end
-  def toolTip(column = 0)
-    super(column)
-  end
-  def whatsThis(column = 0)
-    super(column)
+  # Define the default column to be 0. The new bindings define these as
+  # direct methods on this class, so wrap via alias rather than super
+  # (which the old method_missing-based qtbindings dispatch allowed).
+  %w(background checkState font foreground icon statusTip sizeHint text toolTip whatsThis).each do |meth|
+    if method_defined?(meth) && !method_defined?("qt6_#{meth}")
+      alias_method("qt6_#{meth}", meth)
+      define_method(meth) { |column = 0| send("qt6_#{meth}", column) }
+    end
   end
 end
 
@@ -705,14 +636,32 @@ class Qt::ColorListWidget < Qt::ListWidget
 end
 
 class Qt::Painter
+  # The new bindings define setPen/setBrush directly on this class, so `super`
+  # from a reopen has nothing to call. Wrap via alias instead (same pattern as
+  # Qt::TreeWidgetItem above), covering every spelling the bindings register.
+  %w(setPen set_pen pen= setBrush set_brush brush=).each do |meth|
+    if method_defined?(meth) && !method_defined?("qt6_#{meth}")
+      alias_method("qt6_#{meth}", meth)
+    end
+  end
+
   def setPen(pen_color)
-    super(Cosmos::getColor(pen_color))
+    qt6_setPen(Cosmos::getColor(pen_color))
     @pen_color = pen_color
   end
+  alias_method :set_pen, :setPen
+  alias_method :pen=, :setPen
+
   def setBrush(brush)
-    super(Cosmos::getBrush(brush))
+    qt_brush = Cosmos::getBrush(brush)
+    # Callers clear the fill with setBrush(nil). Qt 4 accepted that; the Qt 6
+    # bindings type-check the QBrush reference, so use the Qt::NoBrush style
+    # overload which is what "no brush" means in Qt.
+    qt6_setBrush(qt_brush || Qt::NoBrush)
     @brush = brush
   end
+  alias_method :set_brush, :setBrush
+  alias_method :brush=, :setBrush
 
   def addLineColor(x, y, w, h, color = Cosmos::BLACK)
     setPen(color) if color != @pen_color

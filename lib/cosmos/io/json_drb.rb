@@ -18,23 +18,6 @@ require 'cosmos/io/json_rpc'
 require 'cosmos/io/json_drb_rack'
 require 'rack/handler/puma'
 
-# Add methods to the Puma::Launcher and Puma::Single class so we can tell
-# if the server has been started.
-module Puma
-  class Launcher
-    def running
-      @runner and @runner.running
-    end
-  end
-  class Runner
-  end
-  class Single < Runner
-    def running
-      @server and @server.running
-    end
-  end
-end
-
 module Cosmos
   # JsonDRb implements the JSON-RPC 2.0 Specification to provide an interface
   # for both internal and external tools to access the COSMOS server. It
@@ -48,6 +31,7 @@ module Cosmos
     MINIMUM_REQUEST_TIME = 0.0001
     STOP_SERVICE_TIMEOUT = 10.0 # seconds to wait when stopping the service
     PUMA_THREAD_TIMEOUT  = 10.0 # seconds to wait for the puma threads to die
+    BIND_RETRY_TIMEOUT   = 10.0 # seconds to retry binding a recently-released port
     SERVER_START_TIMEOUT = 15.0 # seconds to wait for the server to start
 
     @@debug = false
@@ -69,6 +53,7 @@ module Cosmos
       @request_times_index = 0
       @request_mutex = Mutex.new
       @server = nil
+      @server_booted = false
       @server_mutex = Mutex.new
     end
 
@@ -78,12 +63,10 @@ module Cosmos
       clients = 0
       @server_mutex.synchronize do
         if @server
-          # @server.stats() returns a string like: { "backlog": 0, "running": 0 }
-          # "running" indicates the number of server threads running, and
-          # therefore the number of clients connected.
-          stats = @server.stats()
-          stats =~ /"running": \d*/
-          clients = $&.split(":")[1].to_i
+          # Puma 5+ stats() returns a Hash. busy_threads is the number of
+          # threads currently servicing requests, i.e. connected clients.
+          stats = @server.stats
+          clients = (stats[:busy_threads] || stats[:running] || 0).to_i
         end
       end
       return clients
@@ -97,16 +80,27 @@ module Cosmos
       @thread = nil
       @server_mutex.synchronize do
         @server = nil
+        @server_booted = false
       end
     end
 
     # Gracefully kill the thread
     def graceful_kill
-      @server_mutex.synchronize do
-        begin
-          @server.stop if @server and @server.running
-        rescue
-        end
+      launcher = nil
+      @server_mutex.synchronize { launcher = @server }
+      return unless launcher
+      # If the server is still booting, stopping now would be a noop inside
+      # puma and leak a running server (and its port). Wait for boot first.
+      start_time = Time.now
+      until (Time.now - start_time) > 5.0
+        booted = false
+        @server_mutex.synchronize { booted = @server_booted }
+        break if booted
+        sleep 0.1
+      end
+      begin
+        launcher.stop
+      rescue
       end
     end
 
@@ -129,6 +123,7 @@ module Cosmos
         @thread = Thread.new do
 
           # Create an http server to accept requests from clients
+          bind_deadline = Time.now + BIND_RETRY_TIMEOUT
           begin
             server_config = {
               :Host   => hostname,
@@ -139,9 +134,15 @@ module Cosmos
             }
 
             # The run call will block until the server is stopped.
-            Rack::Handler::Puma.run(JsonDrbRack.new(self, system), server_config) do |server|
+            # The block receives the Puma::Launcher before it runs.
+            Rack::Handler::Puma.run(JsonDrbRack.new(self, system), **server_config) do |launcher|
               @server_mutex.synchronize do
-                @server = server
+                @server = launcher
+              end
+              launcher.events.on_booted do
+                @server_mutex.synchronize do
+                  @server_booted = true
+                end
               end
             end
 
@@ -165,6 +166,16 @@ module Cosmos
           # The address in use error is pretty typical if an existing
           # CmdTlmServer is running so explicitly rescue this
           rescue Errno::EADDRINUSE
+            # Puma releases its port asynchronously after stop, so a quick
+            # stop/start cycle can transiently hit EADDRINUSE. Retry briefly.
+            if Time.now < bind_deadline
+              @server_mutex.synchronize do
+                @server = nil
+                @server_booted = false
+              end
+              sleep 0.25
+              retry
+            end
             @server = nil
             raise "Error binding to port #{port}.\n" +
                   "Either another application is using this port\n" +
@@ -184,7 +195,7 @@ module Cosmos
         while ((Time.now - start_time) < SERVER_START_TIMEOUT) and !server_started
           sleep(0.1)
           @server_mutex.synchronize do
-            server_started = true if @server and @server.running
+            server_started = true if @server_booted
           end
         end
         raise "JsonDRb http server could not be started." unless server_started

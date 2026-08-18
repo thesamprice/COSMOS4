@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [modernize-ruby-qt, cosmos4]
+  pull_request:
+
+jobs:
+  specs:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        ruby: ['3.4', 'head']
+    runs-on: ${{ matrix.os }}
+    env:
+      COSMOS_NO_SIMPLECOV: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+      - name: Build C extensions
+        run: bundle exec rake build
+      - name: Run non-GUI specs
+        run: bundle exec rspec spec --exclude-pattern "gui/**/*_spec.rb" --format progress

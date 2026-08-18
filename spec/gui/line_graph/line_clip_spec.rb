@@ -10,6 +10,10 @@
 
 if RUBY_ENGINE == 'ruby'
   require 'spec_helper'
+  # Must come before cosmos/ext/line_graph: the extension re-declares the
+  # qtbindings class hierarchy and can only agree with the real bindings if
+  # they are already loaded.
+  require 'cosmos/gui/qt'
   require 'cosmos/ext/line_graph'
 
   module Cosmos

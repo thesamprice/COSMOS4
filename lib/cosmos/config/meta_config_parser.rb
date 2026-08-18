@@ -38,9 +38,15 @@ module Cosmos
       tf.write(output)
       tf.close
       begin
-        data = Psych.load_file(tf.path)
+        # Psych 4+ defaults to safe_load; these are trusted COSMOS data
+        # files which use anchors/aliases and symbols
+        if Psych.respond_to?(:unsafe_load_file)
+          data = Psych.unsafe_load_file(tf.path)
+        else
+          data = Psych.load_file(tf.path)
+        end
       rescue => error
-        error_file = "ERROR_#{filename}"
+        error_file = "ERROR_#{File.basename(filename)}"
         File.open(error_file, 'w') { |file| file.puts output }
         raise error.exception("#{error.message}\n\nParsed output written to #{File.expand_path(error_file)}\n")
       end

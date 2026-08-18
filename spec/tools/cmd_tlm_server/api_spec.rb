@@ -31,7 +31,9 @@ module Cosmos
         file.puts 'BACKGROUND_TASK example_background_task1.rb'
         file.puts 'BACKGROUND_TASK example_background_task2.rb'
       end
+      # Save the checked-in example background tasks before overwriting them
       @background1 = File.join(Cosmos::USERPATH,'lib','example_background_task1.rb')
+      FileUtils.cp @background1, Cosmos::USERPATH if File.exist?(@background1)
       File.open(@background1,'w') do |file|
         file.write <<-DOC
 require 'cosmos/tools/cmd_tlm_server/background_task'
@@ -54,6 +56,7 @@ end
 DOC
       end
       @background2 = File.join(Cosmos::USERPATH,'lib','example_background_task2.rb')
+      FileUtils.cp @background2, Cosmos::USERPATH if File.exist?(@background2)
       File.open(@background2,'w') do |file|
         file.write <<-DOC
 require 'cosmos/tools/cmd_tlm_server/background_task'
@@ -80,8 +83,15 @@ DOC
     end
 
     after(:all) do
-      FileUtils.rm_rf @background1
-      FileUtils.rm_rf @background2
+      # Restore the checked-in example background tasks
+      [@background1, @background2].each do |bg|
+        saved = File.join(Cosmos::USERPATH, File.basename(bg))
+        if File.exist?(saved)
+          FileUtils.mv saved, bg
+        else
+          FileUtils.rm_rf bg
+        end
+      end
       # Restore cmd_tlm_server.txt
       FileUtils.mv File.join(Cosmos::USERPATH, 'cmd_tlm_server.txt'),
       File.join(Cosmos::USERPATH,'config','tools','cmd_tlm_server')
@@ -507,6 +517,25 @@ DOC
         expect(result).to include ['ARRAY',[],nil,'Array parameter',nil,nil,false,"FLOAT"]
         # Since ARRAY2 has a format string the default is in quotes
         expect(result).to include ['ARRAY2',"[]",nil,'Array parameter',nil,nil,false,"UINT"]
+      end
+    end
+
+    describe "get_cmd_details" do
+      it "returns the full metadata hash for every parameter" do
+        result = @api.get_cmd_details("INST", "COLLECT")
+        expect(result).to be_a Array
+        names = result.collect { |param| param['name'] }
+        expect(names).to include('TYPE', 'DURATION', 'OPCODE', 'TEMP')
+        result.each do |param|
+          expect(param).to include('name', 'bit_offset', 'bit_size', 'data_type')
+        end
+        type = result.find { |param| param['name'] == 'TYPE' }
+        expect(type['bit_offset']).to eql 64
+        expect(type['bit_size']).to eql 16
+        # Symbols in-process; the JSON-RPC layer stringifies them on the wire
+        expect(type['data_type']).to eql :UINT
+        expect(type['states']).to eql({"NORMAL" => 0, "SPECIAL" => 1})
+        expect(type['required']).to be true
       end
     end
 

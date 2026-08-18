@@ -34,6 +34,7 @@ module Cosmos
         'get_cmd_buffer',
         'get_cmd_list',
         'get_cmd_param_list',
+       'get_cmd_details',
         'get_cmd_hazardous',
         'get_cmd_value',
         'get_cmd_time',
@@ -324,6 +325,22 @@ module Cosmos
         end
       end
       return list
+    end
+
+    # Returns an array of Hashes with all the attributes of each command
+    # parameter, including its position in the packet. The command-side
+    # equivalent of {#get_tlm_details}: where get_cmd_param_list returns a
+    # curated subset, this returns everything {Cosmos::PacketItem} knows --
+    # bit_offset, bit_size, data_type, endianness, array_size, default,
+    # states, ranges, required, format_string, units, description, etc.
+    #
+    # @param target_name (see #get_cmd_list)
+    # @param command_name [String] Name of the command
+    # @return [Array<Hash>] Array of hashes describing every parameter
+    def get_cmd_details(target_name, command_name)
+      System.commands.params(target_name, command_name).collect do |parameter|
+        parameter.to_hash
+      end
     end
 
     # Returns whether the specified command is hazardous
