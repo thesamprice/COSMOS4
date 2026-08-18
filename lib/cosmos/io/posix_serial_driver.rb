@@ -16,6 +16,10 @@ module Cosmos
 
   # Serial driver for use on Posix serial ports found on UNIX based systems
   class PosixSerialDriver
+    # ioctl to request exclusive access to a tty: further open(2)s of the
+    # device by other (non-root) processes fail with EBUSY. Not exported by
+    # the termios gem, so defined per platform.
+    TIOCEXCL = (RUBY_PLATFORM =~ /darwin|bsd/ ? 0x2000740d : 0x540C)
 
     # (see SerialDriver#initialize)
     def initialize(port_name = '/dev/ttyS0',
@@ -46,6 +50,24 @@ module Cosmos
 
       # Open the serial Port
       @handle = Kernel.open(port_name, File::RDWR | File::NONBLOCK)
+
+      # Lock the port so two interfaces or processes cannot share it and
+      # silently interleave each other's reads. flock is the authoritative
+      # check: it covers every open including ptys, and the C++ buffered
+      # channel's dup'd fd shares the same lock. TIOCEXCL additionally makes
+      # the kernel refuse open(2) from applications that never check locks
+      # (real tty devices only; ptys don't enforce it on macOS).
+      unless @handle.flock(File::LOCK_EX | File::LOCK_NB)
+        @handle.close
+        raise "Serial port #{port_name} is locked by another process or interface"
+      end
+      begin
+        @handle.ioctl(TIOCEXCL, 0)
+      rescue SystemCallError, NotImplementedError
+        # Some devices reject the ioctl; the flock above still protects
+        # against every COSMOS instance and lock-aware application.
+      end
+
       flags = @handle.fcntl(Fcntl::F_GETFL, 0)
       @handle.fcntl(Fcntl::F_SETFL, flags & ~File::NONBLOCK)
       @handle.extend Termios

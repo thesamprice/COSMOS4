@@ -1498,6 +1498,7 @@ spec/io/json_drb_rack_spec.rb
 spec/io/json_drb_spec.rb
 spec/io/json_rpc_spec.rb
 spec/io/posix_serial_driver_spec.rb
+spec/io/posix_serial_locking_spec.rb
 spec/io/raw_logger_pair_spec.rb
 spec/io/raw_logger_spec.rb
 spec/io/serial_driver_spec.rb
