@@ -8,20 +8,26 @@ default), so anything the Ruby Script API can ask for, Python can too.
 Usage:
 
     from cosmos_api import CosmosApi
-    api = CosmosApi()                      # localhost:7777
+    api = CosmosApi()                      # localhost API on 127.0.0.1:7777
     api.call('get_target_list')
     api.call('get_tlm_details', [['INST', 'HEALTH_STATUS', 'TEMP1']])
     api.call('get_cmd_details', 'INST', 'COLLECT')
+    api.close()                            # or use it as a context manager
+
+The connection is persistent (HTTP keep-alive): one TCP connection is
+reused across calls and transparently re-established if the server
+drops it. This matters at volume -- a connection-per-request client
+leaves one TIME_WAIT ephemeral port behind per call.
 
 Raw (non-UTF8) strings come back the way the Ruby side encodes them:
 ``{"json_class": "String", "raw": [bytes...]}``; decode_raw() turns those
 into Python bytes recursively.
 """
 
+import http.client
 import itertools
 import json
 import os
-import urllib.request
 
 
 class CosmosError(Exception):
@@ -41,12 +47,14 @@ class CosmosApi:
     # ships "SuperSecret").
     def __init__(self, host="127.0.0.1", port=7777, timeout=10.0,
                  x_csrf_token=None):
-        self.url = f"http://{host}:{port}/"
+        self.host = host
+        self.port = port
         self.timeout = timeout
         self.x_csrf_token = (x_csrf_token
                              or os.environ.get("COSMOS_X_CSRF_TOKEN")
                              or "SuperSecret")
         self._ids = itertools.count()
+        self._connection = None
 
     def call(self, method, *params):
         request = {
@@ -56,18 +64,51 @@ class CosmosApi:
         }
         if params:
             request["params"] = list(params)
-        data = json.dumps(request).encode()
+        body = json.dumps(request)
         headers = {"Content-Type": "application/json-rpc"}
         if self.x_csrf_token:
             headers["X-Csrf-Token"] = self.x_csrf_token
-        req = urllib.request.Request(self.url, data=data, headers=headers)
-        with urllib.request.urlopen(req, timeout=self.timeout) as response:
-            payload = json.loads(response.read().decode())
+
+        # One retry: the persistent connection may have been closed by the
+        # server (keep-alive idle timeout) between calls.
+        for attempt in (1, 2):
+            if self._connection is None:
+                self._connection = http.client.HTTPConnection(
+                    self.host, self.port, timeout=self.timeout)
+            try:
+                self._connection.request("POST", "/", body=body,
+                                         headers=headers)
+                response = self._connection.getresponse()
+                data = response.read()
+                status = response.status
+                break
+            except (http.client.HTTPException, OSError):
+                self.close()
+                if attempt == 2:
+                    raise
+
+        if status != 200 and not data:
+            raise CosmosError(status, f"HTTP {status}")
+        payload = json.loads(data.decode("utf-8"))
         if "error" in payload:
             error = payload["error"]
             raise CosmosError(error.get("code"), error.get("message"),
                               error.get("data"))
         return payload.get("result")
+
+    def close(self):
+        """Closes the persistent connection (reopened on the next call)."""
+        if self._connection is not None:
+            try:
+                self._connection.close()
+            finally:
+                self._connection = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
 
 
 def decode_raw(value):
