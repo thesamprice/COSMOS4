@@ -8,13 +8,44 @@
 # as published by the Free Software Foundation; version 3 with
 # attribution addendums as found in the LICENSE.txt
 
+require 'timeout' # For Timeout::Error
 require 'cosmos/interfaces/interface'
+require 'cosmos/io/buffered_io'
 require 'cosmos/io/udp_sockets'
 require 'cosmos/config/config_parser'
 
 module Cosmos
   # Base class for interfaces that send and receive messages over UDP
+  #
+  # UDP is the transport the GVL hurts most: while any other Ruby thread holds
+  # it this interface's thread is not scheduled, the kernel receive buffer
+  # (SO_RCVBUF) overflows and datagrams are dropped **silently**. By default
+  # this interface therefore hands its socket descriptors to a
+  # {Cosmos::BufferedIO::DatagramChannel}, whose C++ reader thread never touches
+  # a Ruby API and drains the socket the moment a datagram lands. Message
+  # boundaries, counters, timeouts and exceptions are all unchanged: one read
+  # still returns exactly one datagram.
+  #
+  # If the ring itself ever overflows the loss is *counted* in drop_count
+  # instead of being invisible, and the newest telemetry is what survives
+  # (drop-oldest). Buffering is skipped - silently, logged once - when the
+  # extension is not built, when COSMOS_NO_BUFFERED_IO is set, when the
+  # interface is configured with OPTION BUFFERED FALSE, or when the socket is
+  # anything other than a real bound UDP socket.
   class UdpInterface < Interface
+    include BufferedIO::InterfaceOptions
+    # UDP has no stream object, so the interface holds the channels itself
+    include BufferedIO::ChannelHolder
+
+    # Datagrams held in the C++ ring before it starts dropping
+    DEFAULT_RING_DATAGRAMS = 65536
+    # Total bytes held in the C++ ring before it starts dropping. 65536
+    # maximum sized datagrams would be 4 GiB, so a byte cap runs alongside the
+    # datagram cap and whichever is reached first starts dropping.
+    DEFAULT_RING_BYTES = 64 * 1024 * 1024
+    # Seconds to let queued writes drain during disconnect
+    DEFAULT_FLUSH_TIMEOUT = 1.0
+
     # @param hostname [String] Machine to connect to
     # @param write_dest_port [Integer] Port to write commands to
     # @param read_port [Integer] Port to read telemetry from
@@ -69,6 +100,65 @@ module Cosmos
       @read_allowed = false unless @read_port
       @write_allowed = false unless @write_dest_port
       @write_raw_allowed = false unless @write_dest_port
+      # Unlike the byte streams, UDP has no stream object of its own to hold
+      # these, so the defaults are set here and BUFFERED_* overwrites them.
+      initialize_buffered_options(:ring_datagrams => DEFAULT_RING_DATAGRAMS,
+                                  :ring_bytes => DEFAULT_RING_BYTES,
+                                  :overflow_policy => :drop_oldest,
+                                  :flush_timeout => DEFAULT_FLUSH_TIMEOUT)
+      @read_channel = nil
+      @write_channel = nil
+      @last_read_time_f = nil
+    end
+
+    # Supported Options: BUFFERED, which disables the buffered C++ backend for
+    # this interface, plus BUFFERED_RING_DATAGRAMS / BUFFERED_RING_BYTES which
+    # size the read ring (whichever limit is reached first starts dropping) and
+    # BUFFERED_OVERFLOW which selects drop_oldest (default) or drop_newest. All
+    # are parsed by {BufferedIO::InterfaceOptions#set_option}.
+    #
+    # @return [Array<Symbol>] UDP is the one interface with a datagram ring to
+    #   size, so it is the one that accepts BUFFERED_RING_DATAGRAMS
+    def buffered_option_keys
+      [:ring_datagrams, :ring_bytes, :write_high_water, :overflow_policy]
+    end
+
+    # @return [Array<Symbol>] UDP refuses :backpressure. Not reading a UDP
+    #   socket cannot make UDP lossless - it only moves the loss into SO_RCVBUF
+    #   where it is silent and uncountable, which is the exact failure the
+    #   buffered backend exists to fix. Configuring it is a mistake worth
+    #   failing the config load over rather than silently ignoring.
+    def buffered_overflow_policies
+      [:drop_oldest, :drop_newest]
+    end
+
+    # @return [Hash] Buffered channel statistics. Unlike the kernel's silent
+    #   SO_RCVBUF overflow, everything lost here is counted.
+    def buffered_stats
+      # The common shape (see BufferedIO.empty_stats) plus the datagram
+      # specific counter. :stall_count stays zero: a datagram channel refuses
+      # :backpressure on purpose, so it never stalls - :drop_count is the
+      # counter that matters here, and unlike the kernel's it is visible.
+      # Snapshot both channels: disconnect nils them from another thread.
+      read_channel = @read_channel
+      write_channel = @write_channel
+      stats = BufferedIO.empty_stats
+      stats[:buffered_datagrams] = 0
+      return stats unless read_channel or write_channel
+      stats[:buffered] = true
+      if read_channel
+        stats[:bytes_read] = read_channel.bytes_read
+        stats[:drop_count] = read_channel.drop_count
+        stats[:buffered_datagrams] = read_channel.buffered_datagrams
+        stats[:buffered_bytes] = read_channel.buffered_bytes
+        stats[:high_water] = read_channel.high_water
+        stats[:ring_bytes] = read_channel.ring_bytes
+      end
+      if write_channel
+        stats[:bytes_written] = write_channel.bytes_written
+        stats[:pending_write_bytes] = write_channel.pending_write_bytes
+      end
+      stats
     end
 
     # Creates a new {UdpWriteSocket} if the the write_dest_port was given in
@@ -99,6 +189,7 @@ module Cosmos
           @bind_address) if @write_dest_port
       end
       @thread_sleeper = nil
+      adopt_buffered_channels()
     end
 
     # @return [Boolean] Whether the active ports (read and/or write) have
@@ -116,6 +207,9 @@ module Cosmos
 
     # Close the active ports (read and/or write) and set the sockets to nil.
     def disconnect
+      # Stop the C++ threads first: they own dup'ed descriptors, and stopping
+      # them is what unblocks a read parked in the interface thread.
+      release_channels(@buffered_options[:flush_timeout])
       if @write_socket != @read_socket
         Cosmos.close_socket(@write_socket)
       end
@@ -134,21 +228,128 @@ module Cosmos
       return nil
     end
 
-    # Reads from the socket if the read_port is defined
+    # Reads one datagram from the socket if the read_port is defined. Exactly
+    # one datagram per call, buffered or not.
     def read_interface
-      data = @read_socket.read(@read_timeout)
+      # Snapshot: disconnect nils @read_channel from another thread, so testing
+      # it and then dereferencing it is a NoMethodError waiting to happen. A
+      # snapshot cannot go nil underneath us, and a stopped channel raises
+      # IOError, which the rescue below already handles as a disconnect.
+      channel = @read_channel
+      if channel
+        result = channel.read_with_time(@read_timeout)
+        # UdpReadSocket#read raises on timeout, so the buffered path must too
+        raise Timeout::Error, "Read Timeout" if result.nil?
+        data, @last_read_time_f = result
+      else
+        socket = @read_socket
+        raise IOError, "Not connected" unless socket
+        data = socket.read(@read_timeout)
+        @last_read_time_f = nil
+      end
       read_interface_base(data)
+      # The C++ reader stamped this datagram when the kernel handed it over.
+      # That is a truer receive time than Time.now in a thread that may have
+      # been waiting on the GVL, so prefer it when we have it.
+      @read_raw_data_time = Time.at(@last_read_time_f).sys if @last_read_time_f
       return data
     rescue IOError # Disconnected
       return nil
     end
 
-    # Writes to the socket
+    # Writes one datagram to the socket
     # @param data [String] Raw packet data
     def write_interface(data)
       write_interface_base(data)
-      @write_socket.write(data, @write_timeout)
+      channel = @write_channel
+      if channel
+        # The C++ writer thread owns the syscall - this only queues, in order.
+        result = channel.write(data, @write_timeout)
+        raise Timeout::Error, "Write Timeout" if result == false
+      else
+        socket = @write_socket
+        raise IOError, "Not connected" unless socket
+        socket.write(data, @write_timeout)
+      end
       data
+    end
+
+    protected
+
+    # Hand the socket descriptors to the C++ channels. Any failure at all falls
+    # back to the stock Ruby sockets - a buffering problem must never be able
+    # to break an interface that plain Ruby can serve.
+    def adopt_buffered_channels
+      unless buffered?
+        # Every other interface logs this from its build_stream; UDP has no
+        # stream to build, so it is logged here instead. Without it a UDP
+        # interface was the one transport that fell back to the stock sockets
+        # without ever saying so.
+        log_buffered_fallback()
+        return
+      end
+      return if @read_channel or @write_channel
+
+      begin
+        if adoptable_socket?(@read_socket)
+          @read_channel = BufferedIO::DatagramChannel.adopt(
+            raw_socket(@read_socket).fileno,
+            @buffered_options[:ring_datagrams], @buffered_options[:ring_bytes])
+          overflow_policy = @buffered_options[:overflow_policy]
+          @read_channel.overflow_policy = overflow_policy if overflow_policy
+        end
+        if adoptable_socket?(@write_socket)
+          if @write_socket.equal?(@read_socket) and @read_channel
+            @write_channel = @read_channel
+          else
+            # A write only socket never delivers telemetry, so it does not need
+            # a telemetry sized ring.
+            @write_channel = BufferedIO::DatagramChannel.adopt(
+              raw_socket(@write_socket).fileno, 1024, 1024 * 1024)
+          end
+          # An unconnected write socket has nowhere to send(2) to. The stock
+          # write_nonblock would fail the same way, so just use it instead.
+          unless @write_channel.writable?
+            @write_channel.disconnect(0) unless @write_channel.equal?(@read_channel)
+            @write_channel = nil
+          end
+        end
+        high_water = @buffered_options[:write_high_water]
+        if high_water
+          channels.each { |channel| channel.write_high_water = high_water }
+        end
+      rescue Exception => error
+        # The extension loaded (we got past buffered?), so this is about these
+        # sockets, not about a missing build - say so rather than reporting the
+        # extension as unavailable and sending the operator to rebuild it.
+        BufferedIO.log_fallback(@name,
+                                "buffered UDP channel could not be created "\
+                                "(#{error.class}: #{error.message})")
+        Logger.warn("#{@name}: buffered UDP unavailable: "\
+                    "#{error.class}: #{error.message}") if defined?(Logger)
+        release_channels(0)
+      end
+    end
+
+    # Only a real, bound UDP socket is adopted. A test double, a mock or
+    # anything else keeps the stock Ruby path. Deliberately uses is_a? and
+    # instance_variable_get rather than duck typing: UdpReadWriteSocket
+    # forwards through method_missing without a respond_to_missing?, and
+    # probing a double with an unexpected message would fail the caller's test
+    # instead of quietly falling back.
+    def adoptable_socket?(socket)
+      return false unless socket.is_a?(UdpReadWriteSocket)
+      raw = raw_socket(socket)
+      return false unless raw.is_a?(::UDPSocket)
+      return false if raw.closed?
+      true
+    rescue Exception
+      false
+    end
+
+    # @return [UDPSocket|nil] The UDPSocket wrapped by a UdpReadWriteSocket
+    def raw_socket(socket)
+      socket.instance_variable_get(:@socket)
     end
   end
 end

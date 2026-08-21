@@ -11,6 +11,7 @@
 require 'spec_helper'
 require 'cosmos/io/buffered_io'
 require 'cosmos/interfaces/tcpip_client_interface'
+require 'cosmos/interfaces/udp_interface'
 require 'cosmos/streams/buffered_tcpip_socket_stream'
 require 'socket'
 
@@ -151,6 +152,27 @@ module Cosmos
       it "raises on a garbage BUFFERED_OVERFLOW" do
         expect { tcp_interface.set_option('BUFFERED_OVERFLOW', ['drop_oldst']) }
           .to raise_error(ArgumentError, /must be one of/)
+      end
+
+      # Not reading a UDP socket cannot make UDP lossless, it only moves the
+      # loss into SO_RCVBUF where nothing counts it. Asking for it is a
+      # mistake worth failing the config load over.
+      it "raises on backpressure for UDP but allows it for a byte stream" do
+        expect { udp_interface.set_option('BUFFERED_OVERFLOW', ['backpressure']) }
+          .to raise_error(ArgumentError, /drop_oldest, drop_newest/)
+        interface = tcp_interface
+        interface.set_option('BUFFERED_OVERFLOW', ['backpressure'])
+        expect(interface.instance_variable_get(:@buffered_options)[:overflow_policy])
+          .to eql :backpressure
+      end
+
+      it "raises on a BUFFERED_RING_DATAGRAMS outside the legal range" do
+        expect { udp_interface.set_option('BUFFERED_RING_DATAGRAMS', ['8']) }
+          .to raise_error(ArgumentError, /between #{BufferedIO::MIN_RING_DATAGRAMS}/)
+        interface = udp_interface
+        interface.set_option('BUFFERED_RING_DATAGRAMS', ['1024'])
+        expect(interface.instance_variable_get(:@buffered_options)[:ring_datagrams])
+          .to eql 1024
       end
 
       it "validates BUFFERED_READ_CHUNK and BUFFERED_WRITE_HIGH_WATER" do
