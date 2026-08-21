@@ -506,6 +506,43 @@ module Cosmos
         expect(i2.protocol_info).to eql [[Protocol, [], :READ_WRITE]]
         Cosmos.kill_thread(nil, i.thread)
       end
+
+      # Copying the @options Hash only preserves what the OPTION line said.
+      # Every option that is parsed into an ivar of its own - and that is most
+      # of them - also has to be replayed through set_option, or a recreate
+      # brings the interface back up at the class default for it.
+      it "replays options through set_option so parsed state survives" do
+        source = TcpipClientInterface.new('localhost', '8888', '8888', nil, nil, 'BURST')
+        source.set_option('BUFFERED', ['FALSE'])
+        source.set_option('BUFFERED_RING_BYTES', ['1048576'])
+        expect(source.buffered?).to be false
+
+        # A recreate builds a fresh instance from new connect parameters, so it
+        # starts out buffered exactly as if no OPTION had ever been given.
+        target = TcpipClientInterface.new('localhost', '9999', '9999', nil, nil, 'BURST')
+        expect(target.instance_variable_get(:@buffered)).to be_nil
+
+        source.copy_to(target)
+        expect(target.options['BUFFERED']).to eql ['FALSE']
+        expect(target.buffered?).to be false
+        expect(target.instance_variable_get(:@buffered_options)[:ring_bytes]).to eql 1048576
+      end
+
+      it "does not abort the copy when an option cannot be replayed" do
+        allow(Logger).to receive(:warn)
+        source = Interface.new
+        source.name = 'TEST'
+        # An option the target refuses. The old behavior was to lose every
+        # parsed option silently; losing just this one is strictly better than
+        # failing the whole recreate.
+        source.instance_variable_get(:@options)['BOGUS'] = ['VALUE']
+
+        target = Interface.new
+        allow(target).to receive(:set_option).and_raise(ArgumentError, 'nope')
+        expect { source.copy_to(target) }.to_not raise_error
+        expect(target.name).to eql 'TEST'
+        expect(target.options['BOGUS']).to eql ['VALUE']
+      end
     end
 
   end

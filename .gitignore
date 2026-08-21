@@ -54,3 +54,6 @@ vendor/bundle/
 python/venv/
 __pycache__/
 *.pyc
+*.dSYM/
+spec/install/cmd_tlm_server.txt
+spec/install/example_background_task1.rb

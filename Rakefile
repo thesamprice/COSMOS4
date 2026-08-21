@@ -148,7 +148,8 @@ task :build => [:devkit] do
       'line_graph',
       'packet',
       'platform',
-      'buffered_file']
+      'buffered_file',
+      'buffered_io']
 
     extensions.each do |extension_name|
       Dir.chdir "ext/cosmos/ext/#{extension_name}"
@@ -158,7 +159,12 @@ task :build => [:devkit] do
       FileUtils.rm_f 'Makefile'
       system('ruby extconf.rb')
       system('make')
-      FileUtils.copy("#{extension_name}.#{shared_extension}", '../../../../lib/cosmos/ext/.')
+      # Remove the destination first. Overwriting a Mach-O in place invalidates
+      # its code signature on macOS (arm64), which makes dyld SIGKILL every
+      # process that loads it.
+      installed = "../../../../lib/cosmos/ext/#{extension_name}.#{shared_extension}"
+      FileUtils.rm_f installed
+      FileUtils.copy("#{extension_name}.#{shared_extension}", installed)
       FileUtils.rm_f Dir.glob('*.o')
       FileUtils.rm_f Dir.glob("*.#{shared_extension}")
       FileUtils.rm_f Dir.glob('*.def')

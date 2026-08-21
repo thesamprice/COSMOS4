@@ -351,7 +351,26 @@ module Cosmos
       # read_queue_size is the number of packets in the queue so don't copy
       # write_queue_size is the number of packets in the queue so don't copy
       other_interface.interfaces = self.interfaces.clone
+      # Copying the Hash preserves what an OPTION line SAID; replaying it
+      # through set_option below is what makes the new interface BEHAVE that
+      # way. Most options are parsed into an ivar of their own (FLOW_CONTROL,
+      # LISTEN_ADDRESS, BUFFERED and the BUFFERED_* sizes all are), and a fresh
+      # instance built from new connect parameters starts at the class default
+      # for every one of them. Without the replay, `INTERFACE_SETTING ... OPTION
+      # BUFFERED FALSE` followed by a connect with new parameters came back up
+      # buffered - the operator's explicit opt out silently undone.
       other_interface.options = self.options.clone
+      self.options.each do |option_name, option_values|
+        begin
+          other_interface.set_option(option_name, option_values)
+        rescue Exception => error
+          # An option the new interface will not take must not abort the
+          # recreate: the old behavior was to lose the option entirely, so
+          # losing this one and saying so is strictly better.
+          Logger.warn("#{self.name}: could not replay OPTION #{option_name}: "\
+                      "#{error.class}: #{error.message}") if defined?(Logger)
+        end
+      end
       other_interface.protocol_info = []
       self.protocol_info.each do |protocol_class, protocol_args, read_write|
         other_interface.add_protocol(protocol_class, protocol_args, read_write)
