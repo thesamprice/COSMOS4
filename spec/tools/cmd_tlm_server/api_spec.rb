@@ -1505,7 +1505,27 @@ DOC
       it "gets interface info" do
         info = @api.get_interface_info("INST_INT")
         expect(info[0]).to eq "ATTEMPTING"
-        expect(info[1..-1]).to eq [0,0,0,0,0,0,0]
+        # The original eight element response is unchanged
+        expect(info[1..7]).to eq [0,0,0,0,0,0,0]
+      end
+
+      # Additive: the buffered C++ backend counters were appended as a ninth
+      # element so the CmdTlmServer can show drops and stalls. Everything
+      # before it is exactly what it always was.
+      it "appends the buffered io statistics" do
+        info = @api.get_interface_info("INST_INT")
+        expect(info.length).to eq 9
+        stats = info[8]
+        expect(stats).to be_a Hash
+        # String keys so a JSON-RPC caller sees the same shape as a direct one
+        expect(stats.keys).to all(be_a String)
+        # A plain Interface has no buffered backend, so zeros rather than nil
+        expect(stats['buffered']).to be false
+        expect(stats['drop_count']).to eq 0
+        expect(stats['stall_count']).to eq 0
+        expect(stats['buffered_bytes']).to eq 0
+        expect(stats['high_water']).to eq 0
+        expect(stats['pending_write_bytes']).to eq 0
       end
     end
 
@@ -1513,6 +1533,14 @@ DOC
       it "gets interface name and all info" do
         info = @api.get_all_interface_info.sort
         expect(info[0][0]).to eq "INST_INT"
+      end
+
+      it "carries the buffered io statistics for every interface" do
+        @api.get_all_interface_info.each do |info|
+          expect(info.length).to eq 10 # name plus the nine from get_interface_info
+          expect(info[9]).to be_a Hash
+          expect(info[9]['buffered']).to be false
+        end
       end
     end
 

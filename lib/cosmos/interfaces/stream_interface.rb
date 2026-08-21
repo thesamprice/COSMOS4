@@ -9,11 +9,24 @@
 # attribution addendums as found in the LICENSE.txt
 
 require 'cosmos/interfaces/interface'
+require 'cosmos/io/buffered_io'
 
 module Cosmos
   # Base class for interfaces that act read and write from a stream
   class StreamInterface < Interface
     attr_accessor :stream
+
+    # Buffered C++ backend counters for this interface, taken from the stream
+    # underneath it. Answers with a fully zeroed hash (see
+    # BufferedIO.empty_stats) for a stock stream, so a caller - the
+    # CmdTlmServer interface status in particular - never has to know which
+    # stream class or which transport it is looking at.
+    #
+    # @return [Hash] see {BufferedIO.empty_stats}
+    def buffered_stats
+      return @stream.buffered_stats if @stream.respond_to?(:buffered_stats)
+      BufferedIO.empty_stats
+    end
 
     def initialize(protocol_type = nil, protocol_args = [])
       super()

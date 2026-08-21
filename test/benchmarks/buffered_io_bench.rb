@@ -54,11 +54,21 @@ rescue LoadError
   GVL_TOOLS = false
 end
 $LOAD_PATH.unshift(File.expand_path(File.join(File.dirname(__FILE__), '..', '..', 'lib')))
+# Cosmos::USERPATH is frozen when cosmos is required, so this has to come
+# first. Without it, `bundle exec ruby test/benchmarks/buffered_io_bench.rb`
+# from the repo root leaves USERPATH pointing at a directory with no
+# config/system/system.txt in it, and the server section - the only one that
+# touches System.instance - dies on the first accepted connection. Defaulting
+# to the demo configuration makes every section runnable the obvious way,
+# while still honouring a COSMOS_USERPATH the caller sets deliberately.
+ENV['COSMOS_USERPATH'] ||=
+  File.expand_path(File.join(File.dirname(__FILE__), '..', '..', 'demo'))
 require 'cosmos'
 require 'cosmos/streams/tcpip_socket_stream'
 require 'cosmos/streams/buffered_tcpip_socket_stream'
 require 'cosmos/streams/serial_stream'
 require 'cosmos/streams/buffered_serial_stream'
+require 'cosmos/interfaces/tcpip_server_interface'
 require 'cosmos/io/udp_sockets'
 begin
   require 'pty'
@@ -1171,6 +1181,334 @@ module Cosmos
       puts "receive time the interface stamps on the data."
     end
   end
+
+  # The milestone 4 (TCP server) benchmark.
+  #
+  # A real TcpipServerInterface - the stock Ruby accept loop, one Ruby read
+  # thread per client, the real Length protocol - serves N clients while a Ruby
+  # thread in this process hogs the GVL. A forked blaster opens all N
+  # connections and sends sequenced, timestamped records at a paced rate.
+  #
+  # The headline is "kernel Q": the high water mark of the *kernel* receive
+  # queue on the server side of each client socket. That queue is where a
+  # server which is not draining accumulates, and on TCP a full queue means the
+  # sender is being back-pressured - telemetry stops flowing at the source and
+  # the latency of everything already in flight grows without bound. Stock,
+  # under a GVL hog, the client queues fill. Buffered, the C++ reader threads
+  # keep taking bytes off the sockets no matter what Ruby is doing, so the
+  # backlog moves into the visible C++ ring (ring high) instead, where it is
+  # counted rather than pushed back onto the spacecraft.
+  #
+  # Nothing is ever lost on either backend: TCP has flow control and the byte
+  # stream channels default to :backpressure, so "drops" must read zero for
+  # both. If a ring ever did fill, "stalls" is the counter that says so.
+  class TcpipServerBench
+    RECORD_SIZE = 1024
+    CLIENTS = 4
+    RECORDS_PER_CLIENT = 4000
+    # Records per second offered across all clients
+    OFFERED_RATE = 12_000
+    READ_TIMEOUT = 5.0
+    RUN_SECONDS = 30.0
+    MEGABYTE = 1024.0 * 1024.0
+    SO_NREAD = 0x1020
+    FIONREAD = 0x541B
+
+    def initialize
+      @results = []
+    end
+
+    def run
+      puts "TCP server GVL hog benchmark (the milestone 4 headline)"
+      puts "  ruby        #{RUBY_VERSION} (#{RUBY_PLATFORM})"
+      puts "  extension   #{BufferedIO.extension_loaded? ? 'loaded' : 'NOT LOADED'}"
+      puts "  server      TcpipServerInterface, Length protocol, #{CLIENTS} clients"
+      puts "  record      #{RECORD_SIZE} bytes (4 byte length + 4 byte client + "\
+           "4 byte sequence + 8 byte send time)"
+      puts "  offered     #{CLIENTS * RECORDS_PER_CLIENT} records at #{OFFERED_RATE}/s"
+      puts ""
+
+      [false, true].each do |hog|
+        [:stock, :buffered].each do |backend|
+          @results << measure(backend, hog)
+        end
+      end
+      report
+    end
+
+    private
+
+    def free_port
+      socket = TCPServer.new('127.0.0.1', 0)
+      port = socket.addr[1]
+      socket.close
+      port
+    end
+
+    def measure(backend, hog)
+      STDERR.puts "  running server #{backend} hog=#{hog ? 'yes' : 'no'}"
+      port = free_port
+      # The real interface, with the real protocol stack on top of it. Only the
+      # stream under each accepted client differs between the two backends.
+      server = TcpipServerInterface.new(port.to_s, port.to_s, '5', READ_TIMEOUT.to_s,
+                                        'length', 0, 32, 0, 1, 'BIG_ENDIAN')
+      server.listen_address = '127.0.0.1'
+      server.set_option('BUFFERED', ['FALSE']) if backend == :stock
+      server.connect
+
+      # Forked AFTER the server's channels exist, which is safe for one reason
+      # and one reason only: the child never touches them. fork(2) copies just
+      # the calling thread, so every C++ reader and writer thread this process
+      # started is simply absent on the other side - the channel objects are
+      # there, their threads are not, and using one would park forever on a
+      # condition variable nobody will signal. The child opens its own sockets
+      # and exits through exit! rather than exit, deliberately skipping the
+      # at_exit and END handlers (including the extension's teardown proc):
+      # those would try to stop channels whose threads do not exist here.
+      report_read, report_write = IO.pipe
+      pid = fork do
+        report_read.close
+        blast(port, report_write)
+        exit!(0)
+      end
+      report_write.close
+
+      # Wait for every client to be accepted before starting the clock
+      deadline = Time.now.sys + 10.0
+      sleep(0.01) while server.num_clients < CLIENTS and Time.now.sys < deadline
+
+      hog_running = true
+      hog_thread = nil
+      if hog
+        # Pure Ruby tight loop: never yields the GVL voluntarily
+        hog_thread = Thread.new { hog_running = hog_running while hog_running }
+        sleep 0.05
+      end
+
+      expected = Array.new(CLIENTS, 0)
+      gaps = 0
+      received = 0
+      total_bytes = 0
+      max_kernel = 0
+      skew_sum = 0.0
+      skew_max = 0.0
+      target = CLIENTS * RECORDS_PER_CLIENT
+      finish = Time.now.sys + RUN_SECONDS
+      start = Time.now.sys
+
+      while received < target and Time.now.sys < finish
+        queued = kernel_queued(server)
+        max_kernel = queued if queued > max_kernel
+        # Never block forever on the queue: a starved stock server can simply
+        # stop producing, and that is a result, not a reason to hang.
+        if server.read_queue_size == 0
+          next if wait_for_packet(server, 0.25)
+          break if server.num_clients == 0
+          next
+        end
+
+        packet = server.read
+        break unless packet
+        received += 1
+        total_bytes += packet.buffer.length
+        client = packet.buffer.byteslice(4, 4).unpack1('N')
+        sequence = packet.buffer.byteslice(8, 4).unpack1('N')
+        sent = packet.buffer.byteslice(12, 8).unpack1('G')
+        if client < CLIENTS
+          if sequence != expected[client]
+            gaps += (sequence - expected[client]) if sequence > expected[client]
+            expected[client] = sequence
+          end
+          expected[client] += 1
+        end
+        skew = Time.now.sys.to_f - sent
+        skew_sum += skew
+        skew_max = skew if skew > skew_max
+      end
+      elapsed = Time.now.sys - start
+
+      stats = server.buffered_stats
+      hog_running = false
+      if hog_thread
+        hog_thread.join(2)
+        hog_thread.kill if hog_thread.alive?
+      end
+      sent_records = begin
+        value = (IO.select([report_read], nil, nil, 5.0) ? report_read.read_nonblock(64) : nil)
+        (value and value.strip.length > 0) ? value.strip.to_i : nil
+      rescue Exception
+        nil
+      end
+      begin
+        report_read.close
+      rescue Exception
+      end
+      server.disconnect
+      reap(pid)
+
+      {
+        :backend => backend,
+        :hog => hog,
+        :elapsed => elapsed,
+        :received => received,
+        :offered => sent_records || target,
+        :bytes => total_bytes,
+        :gaps => gaps,
+        :max_kernel => max_kernel,
+        :ring_high => stats[:high_water] || 0,
+        :drops => stats[:drop_count] || 0,
+        :stalls => stats[:stall_count] || 0,
+        :clients => stats[:clients] || 0,
+        :skew_mean => received > 0 ? (skew_sum / received) : 0.0,
+        :skew_max => skew_max
+      }
+    end
+
+    # Bytes sitting in the kernel receive queue of the busiest client socket.
+    # This is the backlog the server is responsible for emptying.
+    def kernel_queued(server)
+      worst = 0
+      infos = server.instance_variable_get(:@read_interface_infos)
+      return 0 unless infos
+      infos.each do |info|
+        begin
+          socket = info.interface.stream.instance_variable_get(:@read_socket)
+          next unless socket
+          queued = if RUBY_PLATFORM =~ /darwin/
+                     socket.getsockopt(Socket::SOL_SOCKET, SO_NREAD).int
+                   else
+                     buffer = [0].pack('L')
+                     socket.ioctl(FIONREAD, buffer)
+                     buffer.unpack1('L')
+                   end
+          worst = queued if queued > worst
+        rescue Exception
+          # Client went away mid sample
+        end
+      end
+      worst
+    end
+
+    def wait_for_packet(server, timeout)
+      deadline = Time.now.sys + timeout
+      while Time.now.sys < deadline
+        return true if server.read_queue_size > 0
+        sleep 0.005
+      end
+      false
+    end
+
+    # Ask the blaster to stop, then insist. A plain Process.wait here is an
+    # unbounded hang: the child can be blocked in write against a socket the
+    # server is no longer draining, and a benchmark that never returns is worse
+    # than one that reports a bad number.
+    def reap(pid)
+      Process.kill('TERM', pid) rescue nil
+      50.times do
+        return if (Process.waitpid(pid, Process::WNOHANG) rescue pid)
+        sleep 0.1
+      end
+      Process.kill('KILL', pid) rescue nil
+      Process.wait(pid) rescue nil
+    end
+
+    # Child process: open every client connection and send sequenced,
+    # timestamped, length prefixed records at a paced total rate.
+    def blast(port, report)
+      sockets = CLIENTS.times.map do
+        socket = TCPSocket.new('127.0.0.1', port)
+        socket.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
+        socket
+      end
+      filler = 'A' * (RECORD_SIZE - 20)
+      interval = 1.0 / OFFERED_RATE.to_f
+      next_send = Time.now.to_f
+      sent = 0
+      RECORDS_PER_CLIENT.times do |sequence|
+        CLIENTS.times do |client|
+          now = Time.now.to_f
+          sleep(next_send - now) if (next_send - now) > 0.0005
+          next_send += interval
+          record = [RECORD_SIZE].pack('N') << [client].pack('N') <<
+                   [sequence].pack('N') << [Time.now.to_f].pack('G') << filler
+          begin
+            sockets[client].write(record)
+            sent += 1
+          rescue StandardError
+            # The server dropped this client - stop charging it records.
+            #
+            # StandardError, NOT Exception: a SignalException from the parent's
+            # SIGTERM is not a StandardError, and swallowing it here made this
+            # child immortal. Blocked in write against a socket nobody drains,
+            # it caught the signal, looped, and blocked again - while the
+            # parent sat in Process.wait forever. That was the whole of the
+            # `server` section hang.
+          end
+        end
+      end
+      sockets.each { |socket| socket.flush rescue nil }
+      begin
+        report.write(sent.to_s)
+        report.close
+      rescue Exception
+      end
+      sleep 2 # let the server drain before the FINs
+      sockets.each { |socket| socket.close rescue nil }
+    rescue Exception
+      # The server went away - nothing to do
+    end
+
+    def report
+      header = "%-9s %-4s %8s %9s %9s %8s %6s %12s %11s %7s %7s %9s %9s"
+      puts header % ['backend', 'hog', 'seconds', 'received', 'rec/s', 'MB/s',
+                     'gaps', 'kernel Q', 'ring high', 'drops', 'stalls',
+                     'skew ms', 'skew max']
+      puts '-' * 140
+      @results.each do |result|
+        rate = result[:elapsed] > 0 ? (result[:received] / result[:elapsed]) : 0.0
+        megabytes = result[:elapsed] > 0 ? (result[:bytes] / MEGABYTE / result[:elapsed]) : 0.0
+        puts header % [result[:backend], result[:hog] ? 'yes' : 'no',
+                       '%.2f' % result[:elapsed], result[:received], '%.0f' % rate,
+                       '%.1f' % megabytes, result[:gaps], result[:max_kernel],
+                       result[:backend] == :buffered ? result[:ring_high] : '-',
+                       result[:backend] == :buffered ? result[:drops] : '-',
+                       result[:backend] == :buffered ? result[:stalls] : '-',
+                       '%.1f' % (result[:skew_mean] * 1000.0),
+                       '%.1f' % (result[:skew_max] * 1000.0)]
+      end
+      puts ''
+      puts "kernel Q  = high water of the kernel receive queue on the busiest client"
+      puts "            socket. This is the server's backlog. On TCP a full queue is"
+      puts "            back-pressure applied to the spacecraft, not loss - but it is"
+      puts "            the same starvation that silently destroys UDP and serial data."
+      puts "ring high = backlog the C++ rings absorbed instead (worst client). Counted"
+      puts "            and queryable, and it is not sitting on the wire."
+      puts "gaps      = missing sequence numbers. Must be zero for both backends: TCP"
+      puts "            is flow controlled and the stream channels default to"
+      puts "            :backpressure, so nothing is ever dropped by design."
+      puts ''
+
+      stock = @results.find { |r| r[:hog] and r[:backend] == :stock }
+      buffered = @results.find { |r| r[:hog] and r[:backend] == :buffered }
+      return unless stock and buffered
+      puts "#{CLIENTS} clients, GVL hog running:"
+      puts "  kernel receive queue high water: stock #{stock[:max_kernel]} bytes vs "\
+           "buffered #{buffered[:max_kernel]} bytes"
+      puts "    (the stock server leaves the backlog in the kernel, where the only"
+      puts "     remedy is back-pressuring the sender; the buffered server has already"
+      puts "     taken it off the socket)"
+      puts "  C++ rings absorbed #{buffered[:ring_high]} bytes on the worst client, "\
+           "#{buffered[:drops]} dropped, #{buffered[:stalls]} back-pressure stalls"
+      puts "  records drained: stock #{stock[:received]} "\
+           "(#{'%.0f' % (stock[:elapsed] > 0 ? stock[:received] / stock[:elapsed] : 0)}/s) vs "\
+           "buffered #{buffered[:received]} "\
+           "(#{'%.0f' % (buffered[:elapsed] > 0 ? buffered[:received] / buffered[:elapsed] : 0)}/s)"
+      puts "  sequence gaps: stock #{stock[:gaps]}, buffered #{buffered[:gaps]} "\
+           "(both must be zero - TCP never loses)"
+      puts "  clients still buffered at the end: #{buffered[:clients]} of #{CLIENTS}"
+      puts ''
+    end
+  end
 end
 
 case (ARGV[0] || 'all')
@@ -1180,10 +1518,14 @@ when 'udp'
   Cosmos::UdpDropBench.new.run
 when 'serial'
   Cosmos::SerialDropBench.new.run
+when 'server'
+  Cosmos::TcpipServerBench.new.run
 else
   Cosmos::BufferedIoBench.new.run
   puts ''
   Cosmos::UdpDropBench.new.run
   puts ''
   Cosmos::SerialDropBench.new.run
+  puts ''
+  Cosmos::TcpipServerBench.new.run
 end

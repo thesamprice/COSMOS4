@@ -219,6 +219,134 @@ module Cosmos
       end
     end
 
+    describe "get_info" do
+      # The ninth element is the buffered counters. Everything else about
+      # get_info predates this work; what is asserted here is that the shape
+      # arrives intact - String keys, the full BufferedIO.empty_stats key set,
+      # and 'clients' for a server - because the CmdTlmServer status display
+      # indexes into it by name and a missing key is a crash rather than a
+      # blank cell.
+      def build_interfaces(*lines)
+        tf = Tempfile.new('unittest')
+        lines.each { |line| tf.puts line }
+        tf.close
+        interfaces = Interfaces.new(CmdTlmServerConfig.new(tf.path))
+        [interfaces, tf]
+      end
+
+      # The abstract Interface deliberately raises from connected?, and
+      # get_info asks for the state first. Stubbing it keeps these examples
+      # about the ninth element rather than about the base class's contract.
+      def build_stock_interface
+        interfaces, tf = build_interfaces('INTERFACE MY_INT interface.rb')
+        allow(interfaces.all['MY_INT']).to receive(:connected?).and_return(false)
+        [interfaces, tf]
+      end
+
+      # BufferedIO.empty_stats keys, as Strings
+      def expected_keys
+        BufferedIO.empty_stats.keys.map(&:to_s)
+      end
+
+      it "appends the buffered counters without disturbing the first eight" do
+        interfaces, tf = build_stock_interface
+        begin
+          info = interfaces.get_info('MY_INT')
+          expect(info.length).to eql 9
+          # The eight that have always been there
+          expect(info[0]).to eql 'DISCONNECTED'
+          expect(info[1, 7]).to eql [0, 0, 0, 0, 0, 0, 0]
+          expect(info[8]).to be_a Hash
+        ensure
+          tf.unlink
+        end
+      end
+
+      # A stock Interface has no buffered backend at all, and the promise is
+      # that it answers zeros rather than nothing - so a display never has to
+      # special case it.
+      it "reports the zeroed shape for an interface with no buffered backend" do
+        interfaces, tf = build_stock_interface
+        begin
+          buffered = interfaces.get_info('MY_INT')[8]
+          expect(buffered.keys.sort).to eql expected_keys.sort
+          expect(buffered['buffered']).to be false
+          expect(buffered['drop_count']).to eql 0
+          expect(buffered['stall_count']).to eql 0
+          # String keys, so JSON-RPC and a direct API call agree
+          expect(buffered.keys.all? { |key| key.is_a?(String) }).to be true
+        ensure
+          tf.unlink
+        end
+      end
+
+      it "reports the zeroed shape rather than {} when an interface raises" do
+        interfaces, tf = build_stock_interface
+        begin
+          interface = interfaces.all['MY_INT']
+          allow(interface).to receive(:buffered_stats).and_raise('counters exploded')
+          buffered = interfaces.get_info('MY_INT')[8]
+          # Not {}: a caller promised 'buffered' and 'drop_count' blows up on a
+          # bare Hash, and an empty one is indistinguishable from "no counters
+          # exist", which this method documents as reporting zeros.
+          expect(buffered.keys.sort).to eql expected_keys.sort
+          expect(buffered['buffered']).to be false
+        ensure
+          tf.unlink
+        end
+      end
+
+      if RUBY_ENGINE == 'ruby' and BufferedIO.available?
+        # Against a REAL buffered interface with a REAL client attached, not a
+        # double: the aggregation across clients is the part with arithmetic in
+        # it, and it is what the operator reads to answer "is any client
+        # backing up".
+        it "aggregates the counters of a server's connected clients" do
+          allow(Logger.instance).to receive(:info)
+          probe = TCPServer.new('127.0.0.1', 0)
+          port = probe.addr[1]
+          probe.close
+
+          interfaces, tf = build_interfaces(
+            "INTERFACE MY_INT tcpip_server_interface.rb #{port} #{port} 5 5 burst",
+            '  OPTION LISTEN_ADDRESS 127.0.0.1')
+          interface = interfaces.all['MY_INT']
+          clients = []
+          begin
+            interface.connect
+            2.times { clients << TCPSocket.new('127.0.0.1', port) }
+            start = Time.now.sys
+            sleep 0.01 while interface.num_clients < 2 and (Time.now.sys - start) < 5.0
+
+            clients.each { |client| client.write('hello'); client.flush }
+            start = Time.now.sys
+            while interfaces.get_info('MY_INT')[8]['bytes_read'] < 10 and
+                  (Time.now.sys - start) < 5.0
+              sleep 0.01
+            end
+
+            buffered = interfaces.get_info('MY_INT')[8]
+            expect(buffered['buffered']).to be true
+            # Aggregation: 'clients' counts the buffered ones, bytes_read sums
+            # across them, ring_bytes is the worst (largest) rather than a sum
+            # because it is a per client size.
+            expect(buffered['clients']).to eql 2
+            expect(buffered['bytes_read']).to eql 10
+            expect(buffered['drop_count']).to eql 0
+            expect(buffered['ring_bytes']).to eql BufferedIO::Transport::DEFAULT_RING_BYTES
+            expect((expected_keys + ['clients']).sort).to eql buffered.keys.sort
+          ensure
+            clients.each { |client| Cosmos.close_socket(client) }
+            begin
+              interface.disconnect
+            rescue Exception
+            end
+            tf.unlink
+          end
+        end
+      end
+    end
+
     describe "clear_counters" do
       it "clears all interface counters" do
         tf = Tempfile.new('unittest')
