@@ -192,6 +192,7 @@ module Cosmos
         connect_and_accept(port)
         expect(@interface.stream).to be_a TcpipClientStream
         expect(@interface.stream).to_not be_a BufferedTcpipClientStream
+        expect(@interface.buffered_stats[:buffered]).to be false
         @peer.write('stock')
         expect(@interface.read.buffer).to eql 'stock'
       end

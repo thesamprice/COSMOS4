@@ -12,7 +12,9 @@ require 'socket'
 require 'thread' # For Mutex
 require 'timeout' # For Timeout::Error
 require 'cosmos/interfaces/stream_interface'
+require 'cosmos/io/buffered_io'
 require 'cosmos/streams/tcpip_socket_stream'
+require 'cosmos/streams/buffered_tcpip_socket_stream'
 require 'cosmos/config/config_parser'
 
 module Cosmos
@@ -24,7 +26,37 @@ module Cosmos
   # available by calling the TcpipServer read method. For each connection to the
   # write port, a thread is spawned that calls the write method from the
   # interface when data is send to the TcpipServer via the write method.
+  #
+  # == Buffered I/O
+  #
+  # The Ruby accept loop is unchanged. What changes by default is the stream
+  # each accepted client gets: a {BufferedTcpipSocketStream}, so a C++ reader
+  # thread drains that client's socket the moment data lands instead of waiting
+  # for the per client Ruby read thread to win the GVL. Every client has its
+  # own channel, so one client's teardown never touches another's.
+  #
+  # Two deliberate limits on where the buffering is applied:
+  #
+  # * A *write only* client socket (the separate write port configuration) is
+  #   never adopted. {#check_for_dead_clients} detects a departed write client
+  #   by calling recvfrom_nonblock on that socket in Ruby; a C++ reader thread
+  #   on the same descriptor would consume the EOF first and the client would
+  #   never be reaped. The stream is therefore built with
+  #   <tt>:adopt_write_only => false</tt> and those sockets keep the stock Ruby
+  #   write path - which costs nothing, because the server already decouples
+  #   the producer from the socket with its own write queue and write thread.
+  # * When the read and write ports are the same (one socket per client, the
+  #   common case) the single channel serves both directions, exactly as the
+  #   TCP client stream does. check_for_dead_clients explicitly leaves that
+  #   case to the read thread, which the buffered read path detects the same
+  #   way the stock one does (EOF then an empty read).
+  #
+  # Turning it off per interface is OPTION BUFFERED FALSE; globally it is
+  # COSMOS_NO_BUFFERED_IO=1, and it is skipped automatically wherever the
+  # extension is not built.
   class TcpipServerInterface < StreamInterface
+    include BufferedIO::InterfaceOptions
+
     # Data class which stores the interface and associated information
     class InterfaceInfo
       attr_reader :interface, :hostname, :host_ip, :port
@@ -103,6 +135,10 @@ module Cosmos
       @connection_mutex = Mutex.new
       @listen_address = "0.0.0.0"
       @auto_system_meta = false
+      # BUFFERED, BUFFERED_RING_BYTES and BUFFERED_OVERFLOW; each client
+      # stream's own defaults (16 MiB ring, :backpressure) apply until one is
+      # given.
+      initialize_buffered_options()
 
       @read_allowed = false unless ConfigParser.handle_nil(read_port)
       @write_allowed = false unless ConfigParser.handle_nil(write_port)
@@ -269,13 +305,68 @@ module Cosmos
       change_raw_logging(:stop)
     end
 
+    # Buffered channel counters summed over every currently connected client.
+    # A server has no single stream of its own, so the per client streams are
+    # aggregated: :drop_count and :stall_count answer "is any client backing
+    # up" without the operator having to enumerate clients. :clients is how
+    # many of them are actually buffered.
+    #
+    # @return [Hash] see {BufferedIO.empty_stats}, plus :clients
+    def buffered_stats
+      stats = BufferedIO.empty_stats
+      stats[:clients] = 0
+      # Only the client list is taken under the lock. @connection_mutex is also
+      # held for the whole of shutdown_interfaces, which disconnects every
+      # client in turn and can therefore sit inside a flush timeout for
+      # seconds; asking each client for its counters inside the lock would park
+      # the CmdTlmServer API thread - this is called to paint the interface
+      # status display - behind one slow disconnect. Reading the counters
+      # outside it is safe because they are lock free atomics in C++, and a
+      # client that disconnects while we are summing simply reports its final
+      # numbers or :buffered => false.
+      interfaces = nil
+      @connection_mutex.synchronize do
+        interfaces = []
+        @write_interface_infos.each { |info| interfaces << info.interface }
+        @read_interface_infos.each { |info| interfaces << info.interface }
+        interfaces.uniq!
+      end
+      interfaces.each do |interface|
+        next unless interface.respond_to?(:buffered_stats)
+        client = interface.buffered_stats
+        next unless client[:buffered]
+        stats[:buffered] = true
+        stats[:clients] += 1
+        # high_water and ring_bytes are per client sizes, so the interesting
+        # server wide number is the worst client, not the sum.
+        [:bytes_read, :bytes_written, :drop_count, :stall_count,
+         :buffered_bytes, :pending_write_bytes].each do |key|
+          stats[key] += client[key].to_i
+        end
+        [:high_water, :ring_bytes].each do |key|
+          value = client[key].to_i
+          stats[key] = value if value > stats[key]
+        end
+      end
+      stats
+    end
+
     # Supported Options
     # LISTEN_ADDRESS - Ip address of the interface to accept connections on - Default: 0.0.0.0
     # AUTO_SYSTEM_META - Automatically send SYSTEM META on connect - Default false
+    # BUFFERED, BUFFERED_RING_BYTES (each client's read ring) and
+    #   BUFFERED_OVERFLOW are parsed by
+    #   {BufferedIO::InterfaceOptions#set_option}, reached through the super
+    #   below. TCP is lossless today and stays lossless by default; see
+    #   doc/buffered_io_design.md.
     # (see Interface#set_option)
     def set_option(option_name, option_values)
       super(option_name, option_values)
-      case option_name.upcase
+      # to_s first, matching the rest of the buffered option parsing:
+      # set_option is reachable from the JSON API as well as from a config
+      # file, so option_name is not guaranteed to be a String that answers
+      # upcase, and a NoMethodError here would take the whole interface down.
+      case option_name.to_s.upcase
       when 'LISTEN_ADDRESS'
         @listen_address = option_values[0]
       when 'AUTO_SYSTEM_META'
@@ -284,6 +375,26 @@ module Cosmos
     end
 
     protected
+
+    # The stream for one accepted client. Buffered by default; the stock
+    # {TcpipSocketStream} when the extension is unavailable, when
+    # COSMOS_NO_BUFFERED_IO is set or when OPTION BUFFERED FALSE was given.
+    #
+    # A stream that cannot adopt its socket (a test double, a socket that went
+    # away between accept and here) falls back on its own inside
+    # {BufferedSocketStream#adopt_buffered_channels}, so this never has to
+    # decide whether a descriptor is adoptable.
+    def build_client_stream(write_socket, read_socket)
+      if buffered?
+        # :adopt_write_only is false on purpose - see the class comment.
+        BufferedTcpipSocketStream.new(write_socket, read_socket, @write_timeout,
+                                      @read_timeout,
+                                      @buffered_options.merge(:adopt_write_only => false))
+      else
+        log_buffered_fallback()
+        TcpipSocketStream.new(write_socket, read_socket, @write_timeout, @read_timeout)
+      end
+    end
 
     def shutdown_interfaces(interface_infos)
       @connection_mutex.synchronize do
@@ -364,6 +475,34 @@ module Cosmos
         end
       end
 
+      # Everything past the accept is per connection work that can fail for
+      # reasons that have nothing to do with the listener: a DNS lookup, an ACL
+      # check, System.instance itself raising because the configuration is not
+      # loadable, a protocol constructor, the connection callback.
+      #
+      # Before this rescue, any of those propagated out of the accept loop. The
+      # listen thread logged "unexpectedly died" and exited, so the server
+      # accepted nothing ever again - and this socket, fully ESTABLISHED but
+      # never registered in @read_interface_infos / @write_interface_infos, was
+      # leaked: not reachable by disconnect, never closed, with nobody reading
+      # it. A peer writing into it filled the receive queue and blocked forever.
+      # (Found from a benchmark that hung; see doc/buffered_io_design.md.)
+      #
+      # One bad connection now costs that connection and nothing else.
+      begin
+        accept_connection(socket, address, listen_write, listen_read)
+      rescue Exception => err
+        Cosmos.close_socket(socket)
+        Logger.instance.error("#{@name}: Tcpip server dropped connection: #{err.message}")
+        Logger.instance.error(err.formatted)
+      end
+    end
+
+    # The per connection half of {#listen_thread_body}: everything from the
+    # accepted socket to a registered, connected client interface. Split out so
+    # a failure anywhere in it is contained by the caller's rescue instead of
+    # killing the accept loop.
+    def accept_connection(socket, address, listen_write, listen_read)
       port, host_ip = Socket.unpack_sockaddr_in(address)
       hostname = ''
       hostname = Socket.lookup_hostname_from_ip(host_ip) if System.instance.use_dns
@@ -385,7 +524,7 @@ module Cosmos
       read_socket = nil
       write_socket = socket if listen_write
       read_socket = socket if listen_read
-      stream = TcpipSocketStream.new(write_socket, read_socket, @write_timeout, @read_timeout)
+      stream = build_client_stream(write_socket, read_socket)
 
       interface = StreamInterface.new
       interface.target_names = @target_names
@@ -399,6 +538,26 @@ module Cosmos
       interface.stream = stream
       interface.connect
 
+      # From here on the interface owns the socket, so a failure has to tear
+      # the interface down (which stops its buffered channels and closes the
+      # descriptor) rather than leave the caller closing a socket out from
+      # under a running C++ reader thread.
+      begin
+        register_connection(interface, hostname, host_ip, port, listen_write, listen_read)
+      rescue Exception
+        begin
+          interface.disconnect
+        rescue Exception
+          # Already gone; the raise below is the interesting failure
+        end
+        raise
+      end
+      Logger.instance.info "#{@name}: Tcpip server accepted connection from #{hostname}(#{host_ip}):#{port}"
+    end
+
+    # Announce a connected client interface to the callbacks and add it to the
+    # lists {#disconnect} and {#buffered_stats} read.
+    def register_connection(interface, hostname, host_ip, port, listen_write, listen_read)
       if listen_write
         if @auto_system_meta
           meta_packet = System.telemetry.packet('SYSTEM', 'META').clone
@@ -417,7 +576,6 @@ module Cosmos
         end
         start_read_thread(@read_interface_infos[-1])
       end
-      Logger.instance.info "#{@name}: Tcpip server accepted connection from #{hostname}(#{host_ip}):#{port}"
     end
 
     def start_read_thread(interface_info)

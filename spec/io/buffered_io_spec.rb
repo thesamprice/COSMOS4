@@ -11,15 +11,18 @@
 require 'spec_helper'
 require 'cosmos/io/buffered_io'
 require 'cosmos/interfaces/tcpip_client_interface'
+require 'cosmos/interfaces/tcpip_server_interface'
 require 'cosmos/interfaces/udp_interface'
+require 'cosmos/interfaces/serial_interface'
 require 'cosmos/streams/buffered_tcpip_socket_stream'
 require 'socket'
 
 module Cosmos
 
-  # This file runs in BOTH modes on purpose: the module's own behavior - what
-  # it logs and which configurations it accepts - must not depend on whether
-  # the C++ extension was built or on the COSMOS_NO_BUFFERED_IO opt-out.
+  # This file runs in BOTH modes on purpose. It is the proof that every
+  # buffered class degrades to the original pure Ruby code when the C++
+  # extension is unavailable - the platforms the first pass does not cover, and
+  # the COSMOS_NO_BUFFERED_IO opt-out.
   describe BufferedIO do
     describe "feature switch" do
       it "reports whether the extension is loaded" do
@@ -213,6 +216,316 @@ module Cosmos
         expect(stream.instance_variable_get(:@ring_bytes))
           .to eql BufferedIO::Transport::DEFAULT_RING_BYTES
         expect(stream.instance_variable_get(:@read_chunk_bytes)).to eql 65536
+      end
+    end
+
+    describe "empty_stats" do
+      it "is the canonical zeroed shape every transport answers with" do
+        stats = BufferedIO.empty_stats
+        expect(stats[:buffered]).to be false
+        %i(bytes_read bytes_written drop_count stall_count buffered_bytes
+           high_water ring_bytes pending_write_bytes).each do |key|
+          expect(stats[key]).to eql 0
+        end
+      end
+
+      it "returns a fresh hash each time so callers can mutate it" do
+        first = BufferedIO.empty_stats
+        first[:drop_count] = 99
+        expect(BufferedIO.empty_stats[:drop_count]).to eql 0
+      end
+    end
+  end
+
+  # Everything below forces the "extension not available" answer, which is
+  # exactly what a platform without the extension sees. Nothing may raise and
+  # every interface must land on its original stream.
+  describe "buffered I/O fallback (extension unavailable)" do
+    before(:each) do
+      allow(BufferedIO).to receive(:available?).and_return(false)
+      allow(BufferedIO).to receive(:extension_loaded?).and_return(false)
+      allow(BufferedIO).to receive(:log_fallback)
+    end
+
+    def free_tcp_port
+      socket = TCPServer.new('127.0.0.1', 0)
+      port = socket.addr[1]
+      socket.close
+      port
+    end
+
+    def free_udp_port
+      socket = UDPSocket.new
+      socket.bind('127.0.0.1', 0)
+      port = socket.addr[1]
+      socket.close
+      port
+    end
+
+    describe "TcpipClientInterface" do
+      it "reports it is not buffered and builds the stock stream" do
+        interface = TcpipClientInterface.new('localhost', '8888', '8889', '5', '5', 'burst')
+        expect(interface.buffered?).to be false
+        expect(TcpipClientStream).to receive(:new).and_return(double("stream"))
+        expect(BufferedTcpipClientStream).to_not receive(:new)
+        interface.send(:build_stream)
+      end
+    end
+
+    describe "TcpipServerInterface" do
+      it "reports it is not buffered and wraps clients in the stock stream" do
+        interface = TcpipServerInterface.new('8888', '8888', '5', '5', 'burst')
+        expect(interface.buffered?).to be false
+        stream = interface.send(:build_client_stream, nil, nil)
+        expect(stream).to be_a TcpipSocketStream
+        expect(stream).to_not be_a BufferedTcpipSocketStream
+      end
+
+      it "still answers buffered_stats with zeros" do
+        interface = TcpipServerInterface.new('8888', '8888', '5', '5', 'burst')
+        stats = interface.buffered_stats
+        expect(stats[:buffered]).to be false
+        expect(stats[:clients]).to eql 0
+        expect(stats[:drop_count]).to eql 0
+        expect(stats[:stall_count]).to eql 0
+      end
+    end
+
+    describe "UdpInterface" do
+      it "reports it is not buffered and adopts no channels" do
+        port = free_udp_port
+        interface = UdpInterface.new('localhost', 'nil', port.to_s)
+        expect(interface.buffered?).to be false
+        begin
+          interface.connect
+          expect(interface.read_channel).to be_nil
+          expect(interface.write_channel).to be_nil
+          expect(interface.buffered_stats[:buffered]).to be false
+          expect(interface.buffered_stats[:drop_count]).to eql 0
+        ensure
+          interface.disconnect
+        end
+      end
+    end
+
+    describe "SerialInterface" do
+      it "reports it is not buffered and builds the stock stream" do
+        interface = SerialInterface.new('/dev/null', '/dev/null', 9600, :NONE, 1, 10.0, nil, 'burst')
+        expect(interface.buffered?).to be false
+        expect(SerialStream).to receive(:new).and_return(double("stream"))
+        expect(BufferedSerialStream).to_not receive(:new)
+        interface.send(:build_stream)
+      end
+    end
+
+    describe "BufferedTcpipSocketStream" do
+      # The buffered stream class itself must still work when it cannot get a
+      # channel: it inherits the stock implementation and simply uses it.
+      it "reads and writes through the stock Ruby implementation" do
+        server = TCPServer.new('127.0.0.1', 0)
+        port = server.addr[1]
+        client = TCPSocket.new('127.0.0.1', port)
+        peer = server.accept
+        stream = BufferedTcpipSocketStream.new(client, client, 5, 5)
+        begin
+          stream.connect
+          expect(stream.connected?).to be true
+          expect(stream.read_channel).to be_nil
+          expect(stream.write_channel).to be_nil
+          expect(stream.buffered?).to be false
+          expect(stream.buffered_stats[:buffered]).to be false
+
+          stream.write('command')
+          expect(peer.recv(7)).to eql 'command'
+          peer.write('telemetry')
+          expect(stream.read).to eql 'telemetry'
+          expect(stream.flush(1)).to be true
+          expect(stream.last_read_time).to be_nil
+        ensure
+          stream.disconnect
+          Cosmos.close_socket(peer)
+          Cosmos.close_socket(server)
+        end
+      end
+    end
+  end
+
+  # The C++ boundary itself. These use the channel classes directly, so they
+  # run whenever the extension is built - including under COSMOS_NO_BUFFERED_IO,
+  # which only decides whether the interfaces reach for a channel.
+  if RUBY_ENGINE == 'ruby' and BufferedIO.extension_loaded?
+    describe "buffered channel boundary" do
+      before(:each) do
+        @channel = nil
+        @sockets = []
+      end
+
+      after(:each) do
+        begin
+          @channel.disconnect(0) if @channel
+        rescue Exception
+        end
+        @sockets.each { |socket| Cosmos.close_socket(socket) rescue nil }
+      end
+
+      def stream_pair
+        server = TCPServer.new('127.0.0.1', 0)
+        client = TCPSocket.new('127.0.0.1', server.addr[1])
+        peer = server.accept
+        @sockets.concat([server, client, peer])
+        [client, peer]
+      end
+
+      def bound_udp
+        socket = UDPSocket.new
+        socket.bind('127.0.0.1', 0)
+        @sockets << socket
+        socket
+      end
+
+      # FIX 9. A StreamChannel's ring has no message boundaries, so its reader
+      # would splice datagrams together silently. A datagram socket has to go
+      # to DatagramChannel; refusing it here is what makes the interface fall
+      # back instead of quietly corrupting UDP.
+      it "refuses to adopt a SOCK_DGRAM socket as a stream channel" do
+        expect { BufferedIO::StreamChannel.adopt(bound_udp.fileno) }
+          .to raise_error(ArgumentError, /SOCK_STREAM/)
+      end
+
+      it "refuses to adopt something that is neither a socket nor a tty" do
+        reader, writer = IO.pipe
+        begin
+          expect { BufferedIO::StreamChannel.adopt(reader.fileno) }
+            .to raise_error(ArgumentError, /socket or tty/)
+        ensure
+          reader.close
+          writer.close
+        end
+      end
+
+      # FIX 1. The Ruby layer validates first; these prove the extension does
+      # not simply trust whatever reaches it, and that it raises a Ruby
+      # exception rather than allocating something absurd.
+      it "refuses a ring size outside the documented bounds" do
+        client, _peer = stream_pair
+        expect { BufferedIO::StreamChannel.adopt(client.fileno, 1024) }
+          .to raise_error(ArgumentError, /ring bytes/)
+        expect { BufferedIO::StreamChannel.adopt(client.fileno,
+                                                 BufferedIO::MAX_RING_BYTES + 1) }
+          .to raise_error(ArgumentError, /ring bytes/)
+        expect { BufferedIO::DatagramChannel.adopt(bound_udp.fileno, 4) }
+          .to raise_error(ArgumentError, /ring datagrams/)
+      end
+
+      it "accepts exactly the bounds the Ruby layer advertises" do
+        client, _peer = stream_pair
+        @channel = BufferedIO::StreamChannel.adopt(client.fileno, BufferedIO::MIN_RING_BYTES)
+        expect(@channel.connected?).to be true
+        @channel.disconnect(0)
+        @channel = BufferedIO::DatagramChannel.adopt(bound_udp.fileno,
+                                                     BufferedIO::MIN_RING_DATAGRAMS,
+                                                     BufferedIO::MIN_RING_BYTES)
+        expect(@channel.ring_datagrams).to eql BufferedIO::MIN_RING_DATAGRAMS
+      end
+
+      # FIX 9. A zero cap can only return an empty string, which the caller
+      # cannot tell apart from a closed device.
+      it "refuses a non positive max_bytes on read" do
+        client, peer = stream_pair
+        @channel = BufferedIO::StreamChannel.adopt(client.fileno)
+        peer.write('data')
+        expect { @channel.read(1, 0) }.to raise_error(ArgumentError, /max_bytes/)
+        expect { @channel.read(1, -1) }.to raise_error(ArgumentError, /max_bytes/)
+      end
+
+      # FIX 2a. The queue exists to absorb a burst while the GVL is held, not
+      # to hide a dead peer: a 16 MiB mark delayed the Timeout::Error the stock
+      # stream would already have raised.
+      it "defaults the write high water mark to 2 MiB" do
+        client, _peer = stream_pair
+        @channel = BufferedIO::StreamChannel.adopt(client.fileno)
+        expect(@channel.write_high_water).to eql 2 * 1024 * 1024
+        expect(BufferedIO::DEFAULT_WRITE_HIGH_WATER).to eql 2 * 1024 * 1024
+      end
+
+      # FIX 3. A stop that hangs must still be interruptible: without a real
+      # unblock function the disconnect ran with the GVL released and nothing
+      # could reach the thread.
+      # FIX 9. Adopting used to force the descriptor blocking, which is Ruby's
+      # flag (a dup shares the file status flags) and changes how Ruby's own
+      # read_nonblock/write_nonblock behave on the same socket. Both loops park
+      # in poll(2) on EAGAIN instead, so either mode works and the flag is left
+      # exactly as Ruby set it.
+      it "leaves the socket's O_NONBLOCK flag alone and still moves data" do
+        client, peer = stream_pair
+        client.fcntl(Fcntl::F_SETFL, client.fcntl(Fcntl::F_GETFL, 0) | File::NONBLOCK)
+        before = client.fcntl(Fcntl::F_GETFL, 0)
+
+        @channel = BufferedIO::StreamChannel.adopt(client.fileno)
+        expect(client.fcntl(Fcntl::F_GETFL, 0)).to eql before
+        expect(before & File::NONBLOCK).to_not eql 0
+
+        peer.write('nonblocking')
+        expect(@channel.read(5)).to eql 'nonblocking'
+        @channel.write('back')
+        expect(@channel.flush(5)).to be true
+        expect(peer.recv(4)).to eql 'back'
+      end
+
+      # FIX 9. set_destination copies a sockaddr the writer thread reads at the
+      # same time. Unsynchronized, a send could go out against a half written
+      # address - one that never existed.
+      it "retargets a datagram channel safely while writes are in flight" do
+        first = bound_udp
+        second = bound_udp
+        source = UDPSocket.new
+        source.bind('127.0.0.1', 0)
+        @sockets << source
+        @channel = BufferedIO::DatagramChannel.adopt(source.fileno)
+
+        @channel.set_destination('127.0.0.1', first.addr[1])
+        flapper = Thread.new do
+          200.times do |index|
+            target = index.even? ? first : second
+            @channel.set_destination('127.0.0.1', target.addr[1])
+          end
+        end
+        200.times { |index| @channel.write("msg%03d" % index) }
+        flapper.join(10)
+        expect(@channel.flush(5)).to be true
+
+        # Every datagram landed on one of the two real ports, intact.
+        seen = 0
+        [first, second].each do |socket|
+          loop do
+            begin
+              data, = socket.recvfrom_nonblock(100)
+            rescue IO::WaitReadable, Errno::EAGAIN
+              break
+            end
+            expect(data).to match(/\Amsg\d{3}\z/)
+            seen += 1
+          end
+        end
+        expect(seen).to be > 0
+      end
+
+      it "lets Thread#kill escape a disconnect that is stuck flushing" do
+        client, _peer = stream_pair
+        channel = BufferedIO::StreamChannel.adopt(client.fileno)
+        @channel = channel
+        # More than the socket buffers hold, to a peer that never reads: the
+        # writer thread parks in send(2) and the flush can never finish.
+        channel.write_high_water = 64 * 1024 * 1024
+        channel.write('Q' * (16 * 1024 * 1024))
+        expect(channel.pending_write_bytes).to be > 0
+
+        thread = Thread.new { channel.disconnect(300.0) }
+        sleep 0.3
+        expect(thread.alive?).to be true
+        thread.kill
+        expect(thread.join(10)).to_not be_nil
+        expect(thread.alive?).to be false
       end
     end
   end
