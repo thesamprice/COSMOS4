@@ -1497,6 +1497,7 @@ spec/io/json_drb_rack_spec.rb
 spec/io/json_drb_spec.rb
 spec/io/json_rpc_spec.rb
 spec/io/posix_serial_driver_spec.rb
+spec/io/posix_serial_locking_spec.rb
 spec/io/raw_logger_pair_spec.rb
 spec/io/raw_logger_spec.rb
 spec/io/serial_driver_spec.rb
@@ -1541,9 +1542,9 @@ spec/script/scripting_spec.rb
 spec/script/telemetry_spec.rb
 spec/script/tools_spec.rb
 spec/spec_helper.rb
+spec/streams/buffered_serial_stream_spec.rb
 spec/streams/buffered_tcpip_client_stream_spec.rb
 spec/streams/buffered_tcpip_socket_stream_spec.rb
-spec/streams/buffered_serial_stream_spec.rb
 spec/streams/serial_stream_spec.rb
 spec/streams/stream_spec.rb
 spec/streams/tcpip_client_stream_spec.rb
