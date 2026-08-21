@@ -38,6 +38,7 @@ StreamChannel::StreamChannel(int fd, size_t ring_bytes)
       ring_head_(0),
       ring_count_(0),
       overflow_policy_(OverflowPolicy::BACKPRESSURE),
+      stall_count_(0),
       total_received_(0),
       last_receive_time_(0.0),
       last_chunk_time_(0.0) {
@@ -222,6 +223,29 @@ void StreamChannel::set_overflow_policy(OverflowPolicy policy) {
   ring_space_cv_.notify_all();
 }
 
+// Under BACKPRESSURE we simply stop reading the descriptor when the ring is
+// full. The kernel then applies the same flow control the pure Ruby stream
+// relies on - no data is ever dropped by us on a stream transport. Every stall
+// is counted so the condition is visible before anything upstream overruns.
+size_t StreamChannel::reserve_read_space(size_t request) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  bool stalled = false;
+  while (!stop_.load() && overflow_policy_.load() == OverflowPolicy::BACKPRESSURE &&
+         ring_count_ >= ring_.size()) {
+    if (!stalled) {
+      stalled = true;
+      stall_count_.fetch_add(1);
+    }
+    ring_space_cv_.wait(lock);
+  }
+  if (stop_.load()) return 0;
+  if (overflow_policy_.load() == OverflowPolicy::BACKPRESSURE) {
+    size_t free_bytes = ring_.size() - ring_count_;
+    if (request > free_bytes) request = free_bytes;
+  }
+  return request;
+}
+
 // Parks in the kernel until fd_ is ready. stop() calls shutdown_fd(), which for
 // a socket is shutdown(2) and makes poll(2) return at once, so this is always
 // reachable by a join.
@@ -253,22 +277,8 @@ bool StreamChannel::park_ready(short events) {
 void StreamChannel::reader_loop() {
   std::vector<unsigned char> buffer(READ_CHUNK_BYTES);
   while (!stop_.load()) {
-    size_t request = buffer.size();
-    {
-      // Under BACKPRESSURE we simply stop reading the descriptor when the ring
-      // is full. The kernel then applies the same flow control the pure Ruby
-      // stream relies on - no data is ever dropped on a stream transport.
-      std::unique_lock<std::mutex> lock(mutex_);
-      while (!stop_.load() && overflow_policy_.load() == OverflowPolicy::BACKPRESSURE &&
-             ring_count_ >= ring_.size()) {
-        ring_space_cv_.wait(lock);
-      }
-      if (stop_.load()) return;
-      if (overflow_policy_.load() == OverflowPolicy::BACKPRESSURE) {
-        size_t free_bytes = ring_.size() - ring_count_;
-        if (request > free_bytes) request = free_bytes;
-      }
-    }
+    size_t request = reserve_read_space(buffer.size());
+    if (request == 0) return;
 
     ssize_t count = transport_read(&buffer[0], request);
     if (count > 0) {
@@ -287,7 +297,8 @@ void StreamChannel::reader_loop() {
       if (error == EAGAIN || error == EWOULDBLOCK) {
         // The descriptor is non blocking (Ruby's flag, which we do not touch).
         // Retrying immediately would burn a whole core spinning on an idle
-        // link, so park in poll(2) until it has something to say.
+        // link, so park in poll(2) exactly like the serial and datagram
+        // readers do.
         if (!park_ready(POLLIN)) return;
         continue;
       }
