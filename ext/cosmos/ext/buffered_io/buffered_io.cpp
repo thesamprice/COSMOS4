@@ -40,6 +40,7 @@
 #include "ruby/thread.h"
 
 #include "datagram_channel.h"
+#include "serial_channel.h"
 #include "stream_channel.h"
 
 using cosmos::BufferedChannel;
@@ -48,6 +49,7 @@ using cosmos::Clock;
 using cosmos::Datagram;
 using cosmos::DatagramChannel;
 using cosmos::EnqueueResult;
+using cosmos::SerialChannel;
 using cosmos::StreamChannel;
 using cosmos::TcpChannel;
 using cosmos::UdpChannel;
@@ -99,9 +101,9 @@ static void channel_free(void* pointer) {
   delete channel;
 }
 
-/* Virtual dispatch, not sizeof(StreamChannel): a subclass that is larger than
- * the base, or holds more than the ring, reports its own size rather than
- * having the base size quietly attributed to it in ObjectSpace. */
+/* Virtual dispatch, not sizeof(StreamChannel): the pointer here is just as
+ * likely to be a SerialChannel, which is larger, and reporting the base size
+ * for it understates every serial interface in ObjectSpace. */
 static size_t channel_memsize(const void* pointer) {
   const StreamChannel* channel = (const StreamChannel*)pointer;
   if (!channel) return 0;
@@ -329,6 +331,18 @@ static void raise_status(ChannelStatus status, int err) {
  * Duplicates the given descriptor (so Ruby stays free to close its own copy
  * whenever it likes), starts the reader and writer threads and returns the
  * channel.
+ *
+ * Two kinds of byte stream descriptor are adopted, and which one it is decides
+ * how the reader thread is unblocked for a clean join:
+ *
+ *   socket (M1)  - TcpChannel. Blocking recv(2), broken by shutdown(2).
+ *   tty (M3)     - SerialChannel. shutdown(2) is meaningless on a character
+ *                  device, so the reader parks in poll(2) on the tty plus a
+ *                  self-pipe (the mechanism M2 introduced for unconnected UDP
+ *                  sockets) and the descriptor is driven non blocking.
+ *
+ * Anything else - a regular file, a pipe - is refused, and the caller falls
+ * back to the stock Ruby path.
  */
 static VALUE channel_adopt(int argc, VALUE* argv, VALUE klass) {
   VALUE fileno_value = Qnil;
@@ -338,18 +352,19 @@ static VALUE channel_adopt(int argc, VALUE* argv, VALUE klass) {
   int fileno = NUM2INT(fileno_value);
   size_t ring_bytes = checked_ring_bytes(ring_value, StreamChannel::DEFAULT_RING_BYTES);
 
-  /* M1 adopts sockets only: shutdown(2) is what guarantees the reader thread
-   * can always be unblocked for a clean join. */
   int socket_type = 0;
   socklen_t socket_type_length = sizeof(socket_type);
-  if (::getsockopt(fileno, SOL_SOCKET, SO_TYPE, &socket_type, &socket_type_length) != 0) {
-    rb_raise(rb_eArgError, "buffered channel requires a socket descriptor");
+  bool is_socket =
+      (::getsockopt(fileno, SOL_SOCKET, SO_TYPE, &socket_type, &socket_type_length) == 0);
+  bool is_tty = !is_socket && (::isatty(fileno) != 0);
+  if (!is_socket && !is_tty) {
+    rb_raise(rb_eArgError, "buffered channel requires a socket or tty descriptor");
   }
   /* A StreamChannel is byte stream semantics all the way down: its ring has no
    * message boundaries and its reader would silently splice datagrams
    * together. Only SOCK_STREAM belongs here - a SOCK_DGRAM socket must go to
    * DatagramChannel, and anything else falls back to the stock Ruby path. */
-  if (socket_type != SOCK_STREAM) {
+  if (is_socket && socket_type != SOCK_STREAM) {
     rb_raise(rb_eArgError,
              "buffered stream channel requires a SOCK_STREAM socket "
              "(datagram sockets must use DatagramChannel)");
@@ -368,11 +383,22 @@ static VALUE channel_adopt(int argc, VALUE* argv, VALUE klass) {
   char failure[256];
   failure[0] = '\0';
   try {
-    /* The socket's O_NONBLOCK flag is Ruby's, shared through the dup, and is
-     * deliberately left alone: forcing it blocking would change how Ruby's
-     * own read_nonblock/write_nonblock behave on the same socket. Both loops
-     * park in poll(2) on EAGAIN instead, which works in either mode. */
-    channel = new TcpChannel(duplicate, ring_bytes);
+    if (is_tty) {
+      /* dup(2) shares the file status flags with Ruby's descriptor, which is
+       * harmless here: PosixSerialDriver only ever uses read_nonblock and
+       * write_nonblock, both of which handle EAGAIN. Non blocking is what lets
+       * every wait happen in poll(2), where the self-pipe can reach it - a
+       * thread parked in a blocking tty read(2) cannot be joined at all. */
+      int flags = ::fcntl(duplicate, F_GETFL, 0);
+      if (flags >= 0) ::fcntl(duplicate, F_SETFL, flags | O_NONBLOCK);
+      channel = new SerialChannel(duplicate, ring_bytes);
+    } else {
+      /* The socket's O_NONBLOCK flag is Ruby's, shared through the dup, and is
+       * deliberately left alone: forcing it blocking would change how Ruby's
+       * own read_nonblock/write_nonblock behave on the same socket. Both loops
+       * park in poll(2) on EAGAIN instead, which works in either mode. */
+      channel = new TcpChannel(duplicate, ring_bytes);
+    }
     channel->start();
   } catch (const std::exception& error) {
     snprintf(failure, sizeof(failure), "%s", error.what());
@@ -641,6 +667,19 @@ static VALUE channel_pending_write_bytes(VALUE self) {
 
 static VALUE channel_ring_bytes(VALUE self) {
   return ULL2NUM((unsigned long long)get_channel(self)->ring_bytes());
+}
+
+/* True when this channel was adopted from a tty (a serial port). */
+static VALUE channel_tty(VALUE self) {
+  return get_channel(self)->is_tty() ? Qtrue : Qfalse;
+}
+
+/* Times the reader stopped reading the descriptor because the ring was full.
+ * Only :backpressure can stall; the drop policies count bytes in drop_count
+ * instead. Nonzero means Ruby is not draining fast enough - the condition
+ * that overruns the tty input buffer if it persists. */
+static VALUE channel_stall_count(VALUE self) {
+  return ULL2NUM(get_channel(self)->stall_count());
 }
 
 static VALUE channel_fileno(VALUE self) {
@@ -1024,6 +1063,8 @@ extern "C" void Init_buffered_io(void) {
   rb_define_method(cStreamChannel, "pending_write_bytes",
                    RUBY_METHOD_FUNC(channel_pending_write_bytes), 0);
   rb_define_method(cStreamChannel, "ring_bytes", RUBY_METHOD_FUNC(channel_ring_bytes), 0);
+  rb_define_method(cStreamChannel, "stall_count", RUBY_METHOD_FUNC(channel_stall_count), 0);
+  rb_define_method(cStreamChannel, "tty?", RUBY_METHOD_FUNC(channel_tty), 0);
   rb_define_method(cStreamChannel, "fileno", RUBY_METHOD_FUNC(channel_fileno), 0);
   rb_define_method(cStreamChannel, "write_policy", RUBY_METHOD_FUNC(channel_write_policy), 0);
   rb_define_method(cStreamChannel, "write_policy=", RUBY_METHOD_FUNC(channel_set_write_policy), 1);

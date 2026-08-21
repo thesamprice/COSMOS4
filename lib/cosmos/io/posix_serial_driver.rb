@@ -16,6 +16,22 @@ module Cosmos
 
   # Serial driver for use on Posix serial ports found on UNIX based systems
   class PosixSerialDriver
+    # ioctl to request exclusive access to a tty: further open(2)s of the
+    # device by other (non-root) processes fail with EBUSY. Not exported by
+    # the termios gem, so defined per platform.
+    TIOCEXCL = (RUBY_PLATFORM =~ /darwin|bsd/ ? 0x2000740d : 0x540C)
+    # The matching "release exclusive access" ioctl. On Linux the exclusive
+    # flag lives on the tty itself, not on our descriptor, so it survives our
+    # close(2) for as long as anything else holds the device open - a pty
+    # master/slave pair being the everyday example. Clearing it before close
+    # keeps a port reusable in the same process.
+    TIOCNXCL = (RUBY_PLATFORM =~ /darwin|bsd/ ? 0x2000740e : 0x540D)
+
+    # Set this in the environment to open serial ports without taking any lock
+    # at all (no flock, no TIOCEXCL). The default is locked; this exists for the
+    # deployment that deliberately shares a port with another application, or
+    # for a platform whose driver mishandles the ioctl.
+    NO_LOCK_ENV = 'COSMOS_NO_SERIAL_LOCK'
 
     # (see SerialDriver#initialize)
     def initialize(port_name = '/dev/ttyS0',
@@ -46,6 +62,46 @@ module Cosmos
 
       # Open the serial Port
       @handle = Kernel.open(port_name, File::RDWR | File::NONBLOCK)
+      @exclusive = false
+
+      # Everything from here on runs inside a rescue that closes the handle.
+      # An exception in the middle of configuration (a bad STRUCT key raising
+      # NameError is the realistic one) would otherwise leave the port open and
+      # locked until GC ran a finalizer, so the retry every operator makes next
+      # fails with "locked by another process" and blames the wrong thing.
+      begin
+        lock_port(port_name)
+        configure_port(baud_rate, parity, stop_bits, flow_control, data_bits, struct)
+      rescue Exception
+        @handle.close rescue nil
+        @handle = nil
+        raise
+      end
+    end
+
+    private
+
+    # Take exclusive ownership of the port so two interfaces or processes
+    # cannot share it and silently interleave each other's reads. flock is the
+    # authoritative check: it covers every open including ptys, and the C++
+    # buffered channel's dup'd fd shares the same lock. TIOCEXCL additionally
+    # makes the kernel refuse open(2) from applications that never check locks
+    # (real tty devices only; ptys don't enforce it on macOS).
+    def lock_port(port_name)
+      return if ENV[NO_LOCK_ENV]
+      unless @handle.flock(File::LOCK_EX | File::LOCK_NB)
+        raise "Serial port #{port_name} is locked by another process or interface"
+      end
+      begin
+        @handle.ioctl(TIOCEXCL, 0)
+        @exclusive = true
+      rescue SystemCallError, NotImplementedError
+        # Some devices reject the ioctl; the flock above still protects
+        # against every COSMOS instance and lock-aware application.
+      end
+    end
+
+    def configure_port(baud_rate, parity, stop_bits, flow_control, data_bits, struct)
       flags = @handle.fcntl(Fcntl::F_GETFL, 0)
       @handle.fcntl(Fcntl::F_SETFL, flags & ~File::NONBLOCK)
       @handle.extend Termios
@@ -113,12 +169,27 @@ module Cosmos
       @handle.tcsetattr(Termios::TCSANOW, tio)
     end
 
+    public
+
     # (see SerialDriver#close)
     def close
       if @handle
+        # Give the exclusive flag back before closing. On Linux TIOCEXCL is a
+        # property of the tty, not of our descriptor: it outlives our close(2)
+        # for as long as anything else holds the device open (a pty master
+        # holding its slave open is the case the specs hit), and every later
+        # open(2) of that port then fails with EBUSY even though nothing
+        # actually owns it. Best effort - a device that refused TIOCEXCL in the
+        # first place will refuse this too, and that is fine.
+        begin
+          @handle.ioctl(TIOCNXCL, 0) if @exclusive
+        rescue StandardError, NotImplementedError
+          # Nothing to do: we are closing the descriptor anyway.
+        end
         # Close the serial Port
         @handle.close
         @handle = nil
+        @exclusive = false
       end
     end
 

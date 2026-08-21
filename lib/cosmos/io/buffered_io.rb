@@ -316,9 +316,7 @@ module Cosmos
         if read_channel
           stats[:bytes_read] = read_channel.bytes_read
           stats[:drop_count] = read_channel.drop_count
-          # StreamChannel gains its stall counter with the serial milestone;
-          # until then the zero from empty_stats stands.
-          stats[:stall_count] = read_channel.stall_count if read_channel.respond_to?(:stall_count)
+          stats[:stall_count] = read_channel.stall_count
           stats[:buffered_bytes] = read_channel.buffered_bytes
           stats[:high_water] = read_channel.high_water
           stats[:ring_bytes] = read_channel.ring_bytes
