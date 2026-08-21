@@ -22,10 +22,11 @@ depends on winning the GVL.
 
 Move the device I/O into a small C++ extension whose threads **never
 touch Ruby**: they drain the OS buffers the moment data arrives and park
-it in large user-space buffers. Ruby-side classes **inherit from the
-existing streams/interfaces** and swap only the transport underneath, so
-protocols, interfaces, config files, logging, and the tools see exactly
-the API they see today.
+it in large user-space buffers. The Ruby side swaps only the transport
+underneath — the streams by subclassing, the interfaces by mixing the
+option and channel plumbing into the stock classes (see the Ruby layer
+section) — so protocols, interfaces, config files, logging, and the
+tools see exactly the API they see today.
 
 **Event-driven end to end — no polling anywhere:**
 
@@ -83,16 +84,38 @@ BufferedChannel                (abstract: fd, reader/writer threads,
   syscalls, and join with a timeout — the teardown ordering lessons
   from the Qt 6 bindings apply directly.
 
-## Ruby layer (inheritance; user-facing behavior unchanged)
+## Ruby layer (user-facing behavior unchanged)
+
+The **streams** are subclasses. The **interfaces** are not: buffering is on by
+default, so there was no buffered variant to select — the stock interface
+classes got the behavior directly, through mixins that supply the option
+parsing and the channel bookkeeping. `BufferedSerialInterface` and friends do
+not exist, and nothing should be written expecting them.
 
 ```
-BufferedTcpipSocketStream    < TcpipSocketStream    # read/write/disconnect via TcpChannel
-BufferedTcpipClientStream    < TcpipClientStream    # Ruby resolves/connects, channel adopts the fd
-BufferedSerialStream         < SerialStream         # PosixSerialDriver still does termios; channel adopts the fd
-BufferedSerialInterface      < SerialInterface      # overrides only the stream class
-BufferedTcpipClientInterface < TcpipClientInterface # ditto
-BufferedTcpipServerInterface < TcpipServerInterface # Ruby accept loop unchanged; each accepted fd gets a channel
-BufferedUdpInterface         < UdpInterface         # UdpChannel under read_interface/write_interface
+BufferedTcpipSocketStream < TcpipSocketStream  # read/write/disconnect via TcpChannel
+BufferedTcpipClientStream < TcpipClientStream  # Ruby resolves/connects, channel adopts the fd
+BufferedSerialStream      < SerialStream       # PosixSerialDriver still does termios; channel adopts the fd
+```
+
+The shared plumbing, in `lib/cosmos/io/buffered_io.rb`:
+
+```
+BufferedIO::ChannelHolder     # the two channels, last_read_time, release_channels
+BufferedIO::Transport         # options, stats, read/write/flush/disconnect, adopt-or-fall-back
+BufferedIO::InterfaceOptions  # BUFFERED and BUFFERED_* parsing and validation
+```
+
+and how the interfaces pick it up:
+
+```
+SerialInterface      includes InterfaceOptions; builds a BufferedSerialStream
+TcpipClientInterface includes InterfaceOptions; builds a BufferedTcpipClientStream
+TcpipServerInterface includes InterfaceOptions; Ruby accept loop unchanged, each
+                       accepted fd gets a BufferedTcpipSocketStream of its own
+UdpInterface         includes InterfaceOptions and ChannelHolder, and holds its
+                       DatagramChannels itself - UDP has no stream object to put
+                       them in
 ```
 
 - Existing connect/option parsing stays in Ruby (hostnames, ports,
@@ -106,17 +129,30 @@ BufferedUdpInterface         < UdpInterface         # UdpChannel under read_inte
 
 ### Rollout
 
-1. **Opt-in**: the buffered classes are selectable from
-   `cmd_tlm_server.txt` today (`INTERFACE ... buffered_serial_interface.rb ...`)
-   with identical parameters.
-2. **Default flip**: interface declarations grow a `BUFFERED false`
-   opt-out keyword; the stock interfaces become aliases for the
-   buffered ones once parity is proven.
+**Buffered is the default.** As each transport lands, the stock class
+(`SerialInterface`, `TcpipClientInterface`, `UdpInterface`, ...) routes
+through the buffered channel automatically — existing config files get
+the fix with no changes. Opting out:
+
+- per interface: a `BUFFERED false` interface option in
+  `cmd_tlm_server.txt`
+- globally: `COSMOS_NO_BUFFERED_IO=1` (also the automatic fallback when
+  the extension is not built, e.g. platforms the first pass does not
+  cover), which uses the original pure-Ruby paths unchanged.
 
 ## Verification
 
-- The existing stream/interface specs run against the buffered
-  subclasses unchanged (same contract).
+- The existing stream and interface specs are unchanged and are run in
+  **both** modes. Buffered is the default, so a plain `rspec` run
+  exercises the buffered path through the stock classes; a second run
+  with `COSMOS_NO_BUFFERED_IO=1` exercises the pure Ruby path. Same
+  specs, same assertions, both backends — which is the contract.
+- The buffered-only specs (`spec/streams/buffered_*_spec.rb`,
+  `spec/interfaces/buffered_*_spec.rb`, `spec/io/buffered_io_spec.rb`)
+  cover what only exists when the extension is there: channel
+  lifecycles, overflow policies, counters, receive timestamps. When the
+  extension is absent each of those files reports one skipped example
+  with the reason rather than silently contributing none.
 - **The drop-proof benchmark** (committed): a Ruby thread that hogs the
   GVL (tight loop) while a blaster sends N sequenced UDP datagrams /
   serial bytes at line rate. Current backend: kernel drop counters
@@ -130,13 +166,16 @@ BufferedUdpInterface         < UdpInterface         # UdpChannel under read_inte
 ## Milestones
 
 1. **Core + TCP client**: BufferedChannel/StreamChannel/TcpChannel,
-   BufferedTcpipClientStream/Interface, specs, the GVL-hog benchmark.
-2. **UDP** (the main drop victim): DatagramChannel/UdpChannel,
-   BufferedUdpInterface, sequence-gap proof.
-3. **Serial**: SerialChannel + BufferedSerialInterface, pty tests.
+   BufferedTcpipClientStream under the stock `TcpipClientInterface`, specs,
+   the GVL-hog benchmark.
+2. **UDP** (the main drop victim): DatagramChannel/UdpChannel held by
+   the stock `UdpInterface` itself, sequence-gap proof.
+3. **Serial**: SerialChannel + BufferedSerialStream under the stock
+   `SerialInterface`, pty tests.
 4. **TCP server** interface + write-path polish (high-water policies,
    flush-on-disconnect semantics).
-5. **Default flip**: `BUFFERED` keyword, stock aliases, docs, CI.
+5. **Opt-out plumbing + docs**: `BUFFERED false` option,
+   `COSMOS_NO_BUFFERED_IO`, fallback verification, docs, CI.
 
 ## Non-goals / notes
 
@@ -147,6 +186,6 @@ BufferedUdpInterface         < UdpInterface         # UdpChannel under read_inte
 - Thread-per-channel blocking syscalls are already fully event-driven
   (the kernel parks the thread); the no-polling requirement is about
   sleep loops and timers, of which there are none.
-- Windows (overlapped I/O) is out of scope for the first pass; the
-  Ruby classes fall back to the stock streams where the extension is
-  unavailable.
+- Windows (overlapped I/O) is out of scope for the first pass; where
+  the extension is unavailable the stock pure-Ruby paths are used
+  automatically (same mechanism as the opt-out).
