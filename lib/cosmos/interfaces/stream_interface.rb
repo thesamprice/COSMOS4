@@ -54,6 +54,19 @@ module Cosmos
       end
       return nil if data.nil? or data.length <= 0
       read_interface_base(data)
+      # read_interface_base stamps @read_raw_data_time with Time.now, which is
+      # when this Ruby thread got scheduled - not when the data arrived. Under
+      # load those differ by however long the GVL was held elsewhere, and that
+      # error lands straight in the packet's received_time. A buffered stream
+      # knows the real answer: the C++ reader thread stamped the first byte of
+      # this chunk the instant the kernel handed it over, without the GVL. Use
+      # it when it is there, leave the stock timestamp alone when it is not
+      # (stock stream, unbuffered build, or a channel that was just released).
+      stream = @stream
+      if stream.respond_to?(:last_read_time_f)
+        received_time = stream.last_read_time_f
+        @read_raw_data_time = Time.at(received_time).sys if received_time
+      end
       data
     end
 

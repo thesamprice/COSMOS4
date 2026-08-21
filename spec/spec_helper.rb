@@ -62,6 +62,108 @@ require 'cosmos/utilities/logger'
 
 DEFAULT_USERPATH = Cosmos::USERPATH
 
+# Support for the spec files that need the buffered C++ I/O extension.
+#
+# Those files used to wrap themselves in `if BufferedIO.available?`, which
+# means that on a machine without the extension they contribute ZERO examples
+# and the run is green - indistinguishable from a run where they all passed.
+# Whole files can rot away like that without anyone noticing. Registering a
+# skipped example instead costs one line in the output and makes the gap
+# visible, with the reason attached, which is the difference between "we know
+# this was not exercised" and "we think this passed".
+module BufferedSpecs
+  # @return [String|nil] Why the buffered specs cannot run here, nil when they
+  #   can. The two reasons are genuinely different: an unbuilt extension is
+  #   something to fix, COSMOS_NO_BUFFERED_IO is the stock path being exercised
+  #   on purpose (the stock specs cover it and are run in both modes).
+  def self.skip_reason
+    return "not MRI (RUBY_ENGINE=#{RUBY_ENGINE})" unless RUBY_ENGINE == 'ruby'
+    if Cosmos::BufferedIO.disabled_by_env?
+      return 'buffered I/O switched off by COSMOS_NO_BUFFERED_IO'
+    end
+    unless Cosmos::BufferedIO.extension_loaded?
+      error = Cosmos::BufferedIO.extension_error
+      return "buffered_io extension not built (#{error ? error.message : 'unknown'})"
+    end
+    nil
+  end
+
+  # Register a visible, skipped example group standing in for a spec file that
+  # cannot run here.
+  #
+  # @param label [String] What is not being exercised
+  # @param reason [String|nil] {.skip_reason}, or a caller supplied reason for
+  #   a file with a requirement of its own (a real tty, say)
+  def self.skipped_group(label, reason = nil)
+    reason ||= skip_reason || 'unavailable'
+    RSpec.describe(label) do
+      it "is not exercised here" do
+        skip reason
+      end
+    end
+  end
+
+  # ---- borrowing back a class another spec file has stubbed ----
+  #
+  # spec/interfaces/linc_interface_spec.rb reopens TcpipClientStream and
+  # replaces #connect_nonblock and #write with no-ops. That happens when RSpec
+  # LOADS the file, before any example runs, and it is permanent and process
+  # wide - so every other spec in the run sees it, whatever order the files are
+  # in. For a spec that really connects a TCP client this is not a subtle
+  # difference: connect returns without connecting, and the accept on the other
+  # end blocks forever.
+  #
+  # A file that needs the real class reloads it for its own duration and puts
+  # the other spec's versions back afterwards, so linc keeps working too.
+
+  # @param klass [Class] The class to inspect
+  # @return [Hash] name => [UnboundMethod, visibility] for every method
+  #   currently defined on klass by a file under spec/
+  #
+  # Every spec-owned method, not a hardcoded list: the set of names another
+  # spec happens to stub is not a contract, and the reload below replaces all
+  # of them regardless. Visibility travels with the method because
+  # define_method makes everything public, and a protected method restored
+  # without it silently widens the class for whatever runs next.
+  def self.snapshot_spec_methods(klass)
+    overrides = {}
+    {
+      :public => klass.public_instance_methods(false),
+      :protected => klass.protected_instance_methods(false),
+      :private => klass.private_instance_methods(false)
+    }.each do |visibility, names|
+      names.each do |name|
+        method = klass.instance_method(name)
+        location = method.source_location
+        # Anything defined in lib/ is the real implementation, and the reload
+        # produces an identical one - only spec-installed overrides matter.
+        next unless location and location[0].to_s.include?('/spec/')
+        overrides[name] = [method, visibility]
+      end
+    end
+    overrides
+  end
+
+  # @param overrides [Hash] A {.snapshot_spec_methods} result
+  def self.restore_spec_methods(klass, overrides)
+    overrides.each do |name, (method, visibility)|
+      klass.send(:define_method, name, method)
+      klass.send(visibility, name)
+    end
+  end
+
+  # Reload the real TcpipClientStream for the caller's duration.
+  #
+  # @return [Hash] Pass to {.restore_spec_methods} in an after(:all)
+  def self.claim_real_tcpip_client_stream
+    overrides = snapshot_spec_methods(Cosmos::TcpipClientStream)
+    unless overrides.empty?
+      Cosmos.disable_warnings { load 'cosmos/streams/tcpip_client_stream.rb' }
+    end
+    overrides
+  end
+end
+
 $system_exit_count = 0
 # Overload exit so we know when it is called
 
