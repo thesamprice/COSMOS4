@@ -170,19 +170,27 @@ protected:
 
   // Push one queued item all the way out. The default loops over
   // transport_write until the whole item is gone, which is what a byte stream
-  // needs. Returns false once errno has been latched.
+  // needs. Message transports (DatagramChannel) override it with a single
+  // send: a datagram is sent whole or not at all, and a zero length datagram
+  // is still a datagram. Returns false once errno has been latched.
   virtual bool transport_send_item(const std::string& item);
   // Unblock a thread parked in a syscall on fd_.
   virtual void shutdown_fd();
 
   void latch_eof();
   void latch_errno(int error);
+  // Close the adopted descriptor. Only safe once both threads are joined.
+  void close_fd();
+  // Release the buffers a subclass holds. Called by stop() once the threads
+  // are joined, so a disconnected channel does not sit on its ring until GC
+  // gets around to freeing the object.
+  virtual void release_buffers() {}
 
   // Wakes every thread waiting on this channel.
   virtual void notify_all();
 
-  // Atomic because the destructor writes -1 to it from the stopping thread
-  // while the reader and writer threads, park_ready(), shutdown_fd() and the Ruby
+  // Atomic because close_fd() writes -1 to it from the stopping thread while
+  // the reader and writer threads, park_ready(), shutdown_fd() and the Ruby
   // facing fileno() are all reading it. Every read takes a local copy and
   // checks it for -1 before handing it to a syscall; that does not close the
   // window between the check and the syscall (only joining the threads first

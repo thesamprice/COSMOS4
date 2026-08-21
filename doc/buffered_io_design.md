@@ -80,9 +80,28 @@ BufferedChannel                (abstract: fd, reader/writer threads,
 - Reader/writer latch `errno`/EOF; the next Ruby call raises the mapped
   exception (`EOFError`, `Errno::*`) matching current Stream behavior.
 - Channels are TypedData objects. `disconnect` (and GC dealloc, and a
-  VM-teardown end proc) signal stop, `shutdown(2)` the fd to unblock
-  syscalls, and join with a timeout — the teardown ordering lessons
-  from the Qt 6 bindings apply directly.
+  VM-teardown end proc) signal stop, unblock the parked syscall, and
+  join — the teardown ordering lessons from the Qt 6 bindings apply
+  directly.
+- **Unblocking is per transport.** `shutdown(2)` works for connected
+  sockets (TCP, connected UDP) but on macOS it fails with `ENOTCONN`
+  against an *unconnected* UDP socket and leaves the reader parked in
+  `recvfrom(2)` forever. `DatagramChannel` therefore parks in `poll(2)`
+  on the socket plus a self-pipe and writes one byte to the pipe to
+  stop. This is still event driven — `poll(2)` blocks in the kernel
+  with an infinite timeout — and it costs one `poll` per *burst*, not
+  per datagram, because the reader drains with `MSG_DONTWAIT` until the
+  socket reports `EAGAIN`.
+- **Datagram rings are bounded twice.** 65536 datagrams *or* 64 MiB,
+  whichever is reached first, so a stream of maximum sized datagrams
+  cannot reserve 4 GiB. `drop_count` counts whole datagrams (the
+  meaningful unit for a message transport) where the stream channels
+  count bytes.
+- **`:backpressure` is refused on a datagram channel.** Declining to
+  read the socket cannot make UDP lossless; it only moves the loss into
+  `SO_RCVBUF`, where it is silent and uncountable — the exact failure
+  this extension exists to fix. Datagram channels offer `:drop_oldest`
+  (default) and `:drop_newest` only.
 
 ## Ruby layer (user-facing behavior unchanged)
 
@@ -135,7 +154,9 @@ through the buffered channel automatically — existing config files get
 the fix with no changes. Opting out:
 
 - per interface: a `BUFFERED false` interface option in
-  `cmd_tlm_server.txt`
+  `cmd_tlm_server.txt` (ring sizing rides alongside it:
+  `BUFFERED_RING_BYTES`, and for UDP `BUFFERED_RING_DATAGRAMS` /
+  `BUFFERED_OVERFLOW drop_oldest|drop_newest`)
 - globally: `COSMOS_NO_BUFFERED_IO=1` (also the automatic fallback when
   the extension is not built, e.g. platforms the first pass does not
   cover), which uses the original pure-Ruby paths unchanged.

@@ -61,12 +61,12 @@ public:
   virtual uint64_t buffered_bytes() const;
 
   // Configured ring size. Mirrored into an atomic rather than read off
-  // ring_.size(): this is called from Ruby (buffered_stats, and the GC's
-  // memsize callback) on another thread entirely, and reading a vector's size
-  // while another thread is inside it is a data race with no upper bound on
-  // how wrong the answer is. The mirror keeps reporting the size the channel
-  // was built with, which is what "configured ring size" means and what a
-  // status display wants.
+  // ring_.size(): release_buffers() swaps the vector out at disconnect, and
+  // this is called from Ruby (buffered_stats, and the GC's memsize callback)
+  // on another thread entirely. Reading a vector's size while it is being
+  // swapped is a data race with no upper bound on how wrong the answer is.
+  // The mirror keeps reporting the size the channel was built with, which is
+  // what "configured ring size" means and what a status display wants.
   size_t ring_bytes() const { return ring_bytes_.load(); }
 
   // (see BufferedChannel#footprint)
@@ -90,6 +90,7 @@ protected:
   // than latched as a fatal error.
   virtual bool transport_send_item(const std::string& item);
   virtual void notify_all();
+  virtual void release_buffers();
 
   // Parks in poll(2) on fd_ until it reports one of the requested events, or
   // until stop() fires. Returns false when the channel should stop. No self

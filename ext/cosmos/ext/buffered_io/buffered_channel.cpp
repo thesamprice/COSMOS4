@@ -44,12 +44,7 @@ BufferedChannel::BufferedChannel(int fd)
       writing_bytes_(0) {}
 
 BufferedChannel::~BufferedChannel() {
-  stop(0.0);
-  // exchange, not read-then-write: only one thread may ever close the
-  // descriptor. A double close would land on whatever file the number was
-  // recycled for.
-  int descriptor = fd_.exchange(-1);
-  if (descriptor >= 0) ::close(descriptor);
+  stop(0.0); // joins the threads and closes the descriptor
 }
 
 // Each thread body is wrapped: a C++ exception escaping a std::thread is
@@ -289,13 +284,16 @@ void BufferedChannel::writer_loop() {
 void BufferedChannel::stop(double flush_timeout_s) {
   if (!started_.load()) {
     stop_.store(true);
+    close_fd();
     return;
   }
   if (stop_.load()) {
     // Already stopping/stopped - just make sure the threads are reaped.
     if (reader_thread_.joinable()) reader_thread_.join();
     if (writer_thread_.joinable()) writer_thread_.join();
+    close_fd();
     discard_write_queue();
+    release_buffers();
     return;
   }
 
@@ -316,7 +314,9 @@ void BufferedChannel::stop(double flush_timeout_s) {
 
   if (reader_thread_.joinable()) reader_thread_.join();
   if (writer_thread_.joinable()) writer_thread_.join();
+  close_fd();
   discard_write_queue();
+  release_buffers();
 }
 
 // Both threads are joined by every caller, so nothing will ever send these
@@ -329,6 +329,17 @@ void BufferedChannel::discard_write_queue() {
   write_queue_bytes_ = 0;
   writing_bytes_ = 0;
   space_cv_.notify_all();
+}
+
+// Both threads are joined by every caller, so nothing can reference the
+// descriptor any more. Released here rather than in the destructor: file
+// descriptors are not memory pressure, so waiting for GC to run would let a
+// long lived server exhaust them across reconnect cycles.
+void BufferedChannel::close_fd() {
+  // exchange, not read-then-write: only one thread may close the descriptor.
+  // A double close would land on whatever file the number was recycled for.
+  int descriptor = fd_.exchange(-1);
+  if (descriptor >= 0) ::close(descriptor);
 }
 
 } // namespace cosmos
