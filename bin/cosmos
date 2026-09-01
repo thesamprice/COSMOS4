@@ -38,10 +38,10 @@ def install(install_type, install_folder)
     #Determine if directory exists
     unless File.directory?(dir_name)
       #Create Directory
-      FileUtils.makedirs(dir_name, {:verbose => true})
+      FileUtils.makedirs(dir_name, verbose: true)
 
       #Copy files from gem install directory into new project
-      FileUtils.cp_r(File.join(::Cosmos::PATH, install_folder, '.'), dir_name, {:verbose => true})
+      FileUtils.cp_r(File.join(::Cosmos::PATH, install_folder, '.'), dir_name, verbose: true)
 
       puts "Complete"
     else
