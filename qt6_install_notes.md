@@ -11,8 +11,9 @@ COSMOS4 has been modernized to run on:
 - New libclang-generated Qt bindings from the `qt6-libclang` branch of
   <https://github.com/thesamprice/qtbindings>
 
-All 15 COSMOS tools have been ported to Qt 6 and verified with the test suite
-(19 tests, 656 checks).
+14 of the 15 COSMOS tools have been ported to Qt 6 and are covered by the
+test suite (19 tests, 656 checks). **OpenGL Builder is not ported** -- see
+[Known Issues](#known-issues).
 
 **You do not need libclang or the binding generator.** The qtbindings repo
 ships pre-generated glue and the build picks the right file automatically;
@@ -408,7 +409,9 @@ Launch the COSMOS Launcher and verify that all tools start correctly:
 12. **Command Extractor**
 13. **Handbook Creator**
 14. **Table Manager**
-15. **OpenGL Builder**
+
+**OpenGL Builder** is the exception: it is not ported to Qt 6 and exits with
+`uninitialized constant Qt::GLWidget`.
 
 ## Optional: Qt 4 Legacy Support
 
@@ -482,6 +485,28 @@ ruby --version  # Verify you're using Ruby 3.2+
 which ruby      # Check which Ruby is in your PATH
 ```
 
+### libEGL / GLX warnings over SSH X11 forwarding
+
+Running a tool through `ssh -X` prints warnings like:
+
+```
+libEGL warning: DRI3 error: Could not get DRI3 device
+libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+No matching fbConfigs or visuals found
+glx: failed to create drisw screen
+```
+
+These are harmless. A forwarded X connection has no direct rendering, so
+Mesa cannot get a DRI3 device and its software GLX fallback finds no usable
+visual. Qt renders widgets with the raster engine, not OpenGL, so every
+ported tool works normally -- only the unported OpenGL Builder needs GL.
+
+To silence them, force software GL:
+
+```bash
+export LIBGL_ALWAYS_SOFTWARE=1
+```
+
 ### Headless / offscreen
 
 `QT_QPA_PLATFORM=offscreen` lets the tools start without a display:
@@ -550,6 +575,12 @@ it only uses API a newer Qt still provides, while the reverse is not.
 
 ## Known Issues
 
+- **OpenGL Builder does not run on Qt 6.** `lib/cosmos/gui/opengl/gl_viewer.rb`
+  subclasses `Qt::GLWidget` (Qt 4's `QGLWidget`), which the Qt 6 bindings do
+  not provide -- no QOpenGL class is in the generator's class list. Launching
+  it fails with `NameError: uninitialized constant Qt::GLWidget`. Porting it
+  means binding `QOpenGLWidget` and rewriting the viewer against the Qt 6
+  OpenGL API, since `QGLWidget` was removed in Qt 6.
 - DART is now opt-in (`COSMOS_DART=1`) due to Rails 5.1 incompatibility with modern Ruby
 - Some distributions may package Qt 6 with different library names
 - The Launcher shows the legal agreement dialog on every start, so it cannot
