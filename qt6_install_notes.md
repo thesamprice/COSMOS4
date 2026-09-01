@@ -293,6 +293,8 @@ the subdirectories it created, never the prefix itself).
              qt6.rb, qt6.so, Qt/...  -- Qt 6 bindings, flattened in
   gems/      vendored gem dependencies (a GEM_PATH root)
   data/  demo/  install/  config/
+  cosmos.gemspec          -- lets a project bundle against this install
+                             (COSMOS_DEVEL=<prefix>)
 ```
 
 Directories and executables are `0755` and regular files `0644`, so others
@@ -362,6 +364,55 @@ Sourcing `cosmos_env.sh` is what you need for a *project's own* scripts
 
 `COSMOS_QT6_LIB` is not needed with a prefix install -- the bindings are
 installed into `<prefix>/lib`, which is already on `RUBYLIB`.
+
+### Pointing your own project at the install
+
+A COSMOS project's `Gemfile` (the one `cosmos demo`/`cosmos install` gives
+you) reads:
+
+```ruby
+if ENV['COSMOS_DEVEL']
+  gem 'cosmos', :path => ENV['COSMOS_DEVEL']
+else
+  gem 'cosmos'
+end
+```
+
+and `tools/tool_launch.rb` runs `require 'bundler/setup'` before anything
+else, so bundler decides which COSMOS you get. Point it at the install:
+
+```bash
+cd ~/myproject
+COSMOS_DEVEL=/local/opt bundle install
+COSMOS_DEVEL=/local/opt ruby Launcher
+```
+
+Export `COSMOS_DEVEL=/local/opt` in your shell profile and both commands
+shorten back to `bundle install` / `ruby Launcher`. `COSMOS_QT6_LIB` is not
+needed: the bindings are installed into the same `lib/` directory as COSMOS,
+so bundler puts them on the load path along with it.
+
+> **Do not leave `COSMOS_DEVEL` unset.** `gem 'cosmos'` carries no version
+> constraint, so bundler resolves it against rubygems and installs
+> **cosmos 5.x** -- the containerized web rewrite, a different product with no
+> Qt GUI and no `Cosmos::Launcher`. The tool then fails *after* Qt has already
+> started, which makes unrelated `libEGL`/GLX warnings look like the cause.
+> Check which one you have with:
+>
+> ```bash
+> ruby -e 'require "cosmos"; puts Cosmos::VERSION'   # 5.x means the wrong gem
+> ```
+>
+> Pinning `gem 'cosmos', '~> 4.5'` is *not* a fix either -- that fetches the
+> released Qt 4 COSMOS from rubygems, which does not work with these Qt 6
+> bindings. The install is the only source of the ported code, so bundler has
+> to be pointed at it explicitly.
+
+`rake install_prefix` generates `<prefix>/cosmos.gemspec` for exactly this
+purpose. It is generated rather than copied from the repo, whose gemspec
+reads `Manifest.txt`, declares C extensions to compile, and reports version
+`0.0.0` outside a release build -- none of which applies to an installed tree
+whose extensions are already built.
 
 ## Verification
 
