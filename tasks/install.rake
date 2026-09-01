@@ -91,7 +91,15 @@ task :install_prefix do
   # --- Qt 6 bindings, flattened next to cosmos.rb ------------------------
   # qt6.rb falls back to `require 'qt6.so'` from the load path, so the
   # extension sits beside it rather than in an ext/ subtree.
-  install_tree(File.join(qt, 'lib'), paths[:lib])
+  #
+  # Only the Qt 6 files. qtbindings' lib/ also carries the Qt 4 entry points
+  # (Qt.rb, Qt4.rb, Qt/, qtdeclarative, qtscript, qttest, qtuitools,
+  # qtwebkit), and Qt4.rb requires "<ruby version>/qtruby4" -- an extension
+  # that only exists in a Qt 4 build. Installing them means legacy code doing
+  # `require 'Qt'` fails with "cannot load such file -- 3.2/qtruby4" instead
+  # of a straightforward missing-file error, which is thoroughly misleading
+  # on a Qt 6-only install. COSMOS itself references none of them.
+  FileUtils.cp(File.join(qt, 'lib/qt6.rb'), File.join(paths[:lib], 'qt6.rb'))
   FileUtils.cp(qt_ext, File.join(paths[:lib], File.basename(qt_ext)))
 
   # --- gem dependencies ---------------------------------------------------

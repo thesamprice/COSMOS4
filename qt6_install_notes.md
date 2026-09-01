@@ -526,6 +526,57 @@ bundle config set --local path vendor/bundle
 bundle install
 ```
 
+### `cannot load such file -- cosmos`, run from outside the project
+
+`tools/tool_launch.rb` calls `require 'bundler/setup'`, and bundler finds the
+Gemfile by searching upward from the **current directory**, not from the
+script's location. With no Gemfile above the cwd it does not raise -- it
+checks `Bundler.in_bundle?` and silently does nothing -- so no bundle is set
+up, nothing puts COSMOS on the load path, and the next line fails:
+
+```
+LoadError: cannot load such file -- cosmos
+    tools/tool_launch.rb:15
+```
+
+The tell is a relative script path in the backtrace (`gsw/proj/Launcher:13`),
+meaning you launched it from a parent directory. Run from inside the project:
+
+```bash
+cd ~/myproject && ruby Launcher
+```
+
+or name the Gemfile explicitly:
+
+```bash
+BUNDLE_GEMFILE=~/myproject/Gemfile ruby ~/myproject/Launcher
+```
+
+Note that `Cosmos::USERPATH` still resolves correctly from a parent
+directory, so COSMOS gives no hint that you are outside the bundle.
+
+### `cannot load such file -- 3.2/qtruby4` from a custom widget
+
+A custom widget or library doing the Qt 4 idiom
+
+```ruby
+require 'Qt'     # or 'Qt4'
+```
+
+reaches qtbindings' Qt 4 entry point, which requires
+`"<ruby version>/qtruby4"` -- an extension that exists only in a Qt 4 build.
+Use what the stock COSMOS widgets use instead:
+
+```ruby
+require 'cosmos/gui/qt'
+```
+
+That resolves to the Qt 6 bindings. Grep your project for `require 'Qt'` and
+`require 'Qt4'`; none of the 49 widgets shipped with COSMOS require them
+directly, so any hit is project code that needs updating. Note that the
+require is only the first hurdle -- a widget written against Qt 4 may also use
+API that changed in Qt 6.
+
 ### Ruby version issues
 
 COSMOS4 with Qt 6 requires Ruby 3.2 or newer. If you have multiple Ruby
