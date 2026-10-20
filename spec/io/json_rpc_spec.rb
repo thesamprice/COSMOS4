@@ -22,13 +22,13 @@ describe Object do
       @test = 0
     end
     def to_hash
-      Hash.new("test"=>0)
+      Hash.new({"test"=>0})
     end
   end
 
   it "implements as_json" do
     expect(Test1.new.as_json).to eql [:@test]
-    expect(Test2.new.as_json).to eql Hash.new("test"=>0)
+    expect(Test2.new.as_json).to eql Hash.new({"test"=>0})
   end
 end
 

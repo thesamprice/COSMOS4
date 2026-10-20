@@ -21,7 +21,9 @@ module Cosmos
         expect(udp.peeraddr[2]).to eql '127.0.0.1'
         expect(udp.peeraddr[1]).to eql 8888
         udp.close
-        if RUBY_ENGINE == 'ruby' # UDP multicast does not work in Jruby
+        # UDP multicast does not work in Jruby and multicast connect/bind
+        # behaves differently on macOS (EADDRNOTAVAIL)
+        if RUBY_ENGINE == 'ruby' and RbConfig::CONFIG['target_os'] !~ /darwin/
           udp = UdpWriteSocket.new('224.0.1.1', 8888, 7777, '127.0.0.1', 3)
           expect(udp.local_address.ip_port).to eql 7777
           # Reading this back doesn't appear to work in JRUBY, not sure if it is actually taking
@@ -68,7 +70,9 @@ module Cosmos
         expect(udp.local_address.ip_address).to eql '0.0.0.0'
         expect(udp.local_address.ip_port).to eql 8888
         udp.close
-        if RUBY_ENGINE == 'ruby' # UDP multicast does not work in Jruby
+        # UDP multicast does not work in Jruby and multicast connect/bind
+        # behaves differently on macOS (EADDRNOTAVAIL)
+        if RUBY_ENGINE == 'ruby' and RbConfig::CONFIG['target_os'] !~ /darwin/
           udp = UdpReadSocket.new(8888, '224.0.1.1')
           expect(IPAddr.new_ntoh(udp.getsockopt(Socket::IPPROTO_IP, Socket::IP_MULTICAST_IF).data).to_s).to eql "0.0.0.0"
           udp.close
@@ -104,7 +108,9 @@ module Cosmos
         expect(udp.local_address.ip_address).to eql '0.0.0.0'
         expect(udp.local_address.ip_port).to eql 8888
         udp.close
-        if RUBY_ENGINE == 'ruby' # UDP multicast does not work in Jruby
+        # UDP multicast does not work in Jruby and multicast connect/bind
+        # behaves differently on macOS (EADDRNOTAVAIL)
+        if RUBY_ENGINE == 'ruby' and RbConfig::CONFIG['target_os'] !~ /darwin/
           udp = UdpReadWriteSocket.new(8888, '0.0.0.0', 0, '224.0.1.1')
           expect(IPAddr.new_ntoh(udp.getsockopt(Socket::IPPROTO_IP, Socket::IP_MULTICAST_IF).data).to_s).to eql "0.0.0.0"
           udp.close
