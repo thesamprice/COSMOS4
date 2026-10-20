@@ -35,6 +35,7 @@ module Cosmos
         'get_cmd_list',
         'get_cmd_param_list',
        'get_cmd_details',
+        'get_all_commands',
         'get_cmd_hazardous',
         'get_cmd_value',
         'get_cmd_time',
@@ -55,6 +56,7 @@ module Cosmos
         'get_tlm_list',
         'get_tlm_item_list',
         'get_tlm_details',
+        'get_all_telemetry',
         'get_out_of_limits',
         'get_overall_limits_state',
         'limits_enabled?',
@@ -340,6 +342,30 @@ module Cosmos
     def get_cmd_details(target_name, command_name)
       System.commands.params(target_name, command_name).collect do |parameter|
         parameter.to_hash
+      end
+    end
+
+    # Returns complete command packet definitions for a target, including all
+    # parameters with full metadata. This is the COSMOS 4 equivalent of
+    # OpenC3/COSMOS 5's get_all_commands method.
+    #
+    # @param target_name [String] Name of the target
+    # @return [Array<Hash>] Array of command packet hashes, each containing:
+    #   - target_name: Target name
+    #   - packet_name: Command name
+    #   - endianness: Default endianness (BIG_ENDIAN or LITTLE_ENDIAN)
+    #   - description: Command description
+    #   - items: Array of parameter hashes (from PacketItem#to_hash)
+    def get_all_commands(target_name)
+      packets = System.commands.packets(target_name)
+      packets.collect do |packet_name, packet|
+        {
+          'target_name' => packet.target_name,
+          'packet_name' => packet.packet_name,
+          'endianness' => packet.default_endianness.to_s,
+          'description' => packet.description,
+          'items' => packet.sorted_items.collect { |item| item.to_hash }
+        }
       end
     end
 
@@ -817,6 +843,30 @@ module Cosmos
         list << [packet_name, packet.description]
       end
       list.sort
+    end
+
+    # Returns complete telemetry packet definitions for a target, including all
+    # items with full metadata. This is the COSMOS 4 equivalent of
+    # OpenC3/COSMOS 5's get_all_telemetry method.
+    #
+    # @param target_name [String] Name of the target
+    # @return [Array<Hash>] Array of telemetry packet hashes, each containing:
+    #   - target_name: Target name
+    #   - packet_name: Packet name
+    #   - endianness: Default endianness (BIG_ENDIAN or LITTLE_ENDIAN)
+    #   - description: Packet description
+    #   - items: Array of item hashes (from PacketItem#to_hash)
+    def get_all_telemetry(target_name)
+      packets = System.telemetry.packets(target_name)
+      packets.collect do |packet_name, packet|
+        {
+          'target_name' => packet.target_name,
+          'packet_name' => packet.packet_name,
+          'endianness' => packet.default_endianness.to_s,
+          'description' => packet.description,
+          'items' => packet.sorted_items.collect { |item| item.to_hash }
+        }
+      end
     end
 
     # Returns the item names and their states and descriptions for a particular
