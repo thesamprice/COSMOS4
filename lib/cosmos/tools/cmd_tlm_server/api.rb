@@ -341,9 +341,68 @@ module Cosmos
     # @return [Array<Hash>] Array of hashes describing every parameter
     def get_cmd_details(target_name, command_name)
       System.commands.params(target_name, command_name).collect do |parameter|
-        parameter.to_hash
+        item_to_api_hash(parameter)
       end
     end
+
+    # PacketItem#to_hash includes 'range' as a Ruby Range. JsonRpc serializes
+    # Enumerables with to_a, which expands e.g. 0..4294967295 into billions of
+    # elements and exhausts server memory. Send [first, last] instead.
+    def item_to_api_hash(item)
+      hash = item.to_hash
+      range = hash['range']
+      hash['range'] = [range.first, range.last] if range.is_a?(Range)
+      ranges = item_tx_bit_ranges(item)
+      hash['tx_bit_ranges'] = ranges
+      hash['tx_bit_offset'] = ranges.first[0]
+      hash
+    end
+    private :item_to_api_hash
+
+    # Where an item's bits sit in the transmitted stream, independent of byte
+    # order. Bit 0 is the first bit sent (the MSB of byte 0), counting up through
+    # the packet. This is only about which bit goes out first; it says nothing
+    # about byte order, and the two should not be combined.
+    #
+    # COSMOS 4 reports a LITTLE_ENDIAN bitfield's bit_offset as the position of
+    # its most significant bit, with the field extending toward lower byte
+    # addresses (see BinaryAccessor.read). A field that spans bytes then occupies
+    # separate stretches of the stream, so this returns a list of
+    # [first_bit, bit_count] pairs in transmission order. Everything else is a
+    # single range, [bit_offset, size].
+    #
+    # @param item [PacketItem]
+    # @return [Array<Array<Integer>>]
+    def item_tx_bit_ranges(item)
+      offset = item.bit_offset
+      size = item.array_size ? item.array_size.abs : item.bit_size
+      int_type = (item.data_type == :INT || item.data_type == :UINT)
+      packed = (offset % 8 == 0) && [8, 16, 32, 64].include?(item.bit_size)
+      if item.endianness != :LITTLE_ENDIAN || !int_type || packed ||
+         item.array_size || offset < 0 || size <= 0
+        return [[offset, size]]
+      end
+
+      start_bits = offset % 8
+      num_bytes = ((start_bits + size - 1) / 8) + 1
+      upper = offset / 8
+      lower = upper - num_bytes + 1
+      return [[offset, size]] if lower < 0
+      return [[lower * 8 + start_bits, size]] if num_bytes == 1
+
+      spare_low_bits = num_bytes * 8 - start_bits - size
+      segments = [[lower * 8, 8 - spare_low_bits]]
+      segments << [(lower + 1) * 8, (num_bytes - 2) * 8] if num_bytes > 2
+      segments << [upper * 8 + start_bits, 8 - start_bits]
+      segments.each_with_object([]) do |(first, count), merged|
+        if !merged.empty? && merged.last[0] + merged.last[1] == first
+          merged.last[1] += count
+        else
+          merged << [first, count]
+        end
+      end
+    end
+    private :item_tx_bit_ranges
 
     # Returns complete command packet definitions for a target, including all
     # parameters with full metadata. This is the COSMOS 4 equivalent of
@@ -364,7 +423,7 @@ module Cosmos
           'packet_name' => packet.packet_name,
           'endianness' => packet.default_endianness.to_s,
           'description' => packet.description,
-          'items' => packet.sorted_items.collect { |item| item.to_hash }
+          'items' => packet.sorted_items.collect { |item| item_to_api_hash(item) }
         }
       end
     end
@@ -864,7 +923,7 @@ module Cosmos
           'packet_name' => packet.packet_name,
           'endianness' => packet.default_endianness.to_s,
           'description' => packet.description,
-          'items' => packet.sorted_items.collect { |item| item.to_hash }
+          'items' => packet.sorted_items.collect { |item| item_to_api_hash(item) }
         }
       end
     end
@@ -897,7 +956,7 @@ module Cosmos
       details = []
       item_array.each do |target_name, packet_name, item_name|
         _, item = System.telemetry.packet_and_item(target_name, packet_name, item_name)
-        details << item.to_hash
+        details << item_to_api_hash(item)
       end
       details
     end
